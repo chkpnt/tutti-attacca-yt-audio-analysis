@@ -1,0 +1,5 @@
+Input #0, matroska,webm, from 'yt_calibration-aac.webm':
+  Metadata:
+    encoder         : google/video-file
+  Duration: 00:01:00.02, start: 0.000000, bitrate: 12 kb/s
+  Stream #0:0(eng): Audio: opus, 48000 Hz, stereo, fltp (default)
