@@ -11,6 +11,9 @@
 // `currentFrame + i` is the precise sample position in the AudioContext clock.
 // That avoids capture-start latency and main-thread callback scheduling bias.
 //
+// One processor instance is shared across all measured files; the page sends
+// { type: 'reset' } before each file to clear the click/peak state.
+//
 // Fixture contract:
 // - bursts are 50 ms, 1 kHz tones;
 // - burst starts are at 1.000, 1.310, 10.000, 30.000, and 59.000 seconds;
@@ -28,6 +31,13 @@ class ClickDetector extends AudioWorkletProcessor {
     // A positive ready message distinguishes a module/path/CSP failure from a
     // live-but-silent media-element source.
     this.port.postMessage({ type: 'ready', sampleRate });
+
+    this.port.onmessage = (event) => {
+      if (event.data && event.data.type === 'reset') {
+        this.lastClickFrame = -Infinity;
+        this.peak = 0;
+      }
+    };
   }
 
   process(inputs) {
