@@ -495,7 +495,7 @@ Verification of the corrected fixture:
 - Audacity (2026-09-03): imported side by side with `master/calibration.m4a`, all peaks align exactly; the corrected file displays 34 ms longer (60.034 vs 60.000 s) because YouTube's larger end padding survives in the raw span — cosmetic.
 - Browsers (2026-09-06, harness v3): Firefox +0.7 ms, Chromium +1.4 ms, Safari ≈ −7 ms vs the WAV control, each constant from click A to click C — the remaining per-engine constant is the 44.1 kHz presentation shift (see "Browser results"), not a correction error.
 
-Guard for the pipeline: after correcting a fresh download, `extract-clicks.py` must read 0.0 ms. If a future YouTube download measures an offset different from +36.3 ms, YouTube changed its encoding pipeline and the constant must be re-derived.
+Guard for the pipeline: after correcting a fresh download, `extract-clicks.py` must read 0.0 ms — and a cross-correlation of the fresh download against the kept Opus/WebM authoring reference (`scripts/compare-drift.py`) must read ≈ 36.3 ms before correction and 0.0 ms after. If a future YouTube download measures an offset different from +36.3 ms, YouTube changed its encoding pipeline and the constant must be re-derived.
 
 ## Browser measurement harness
 
@@ -566,7 +566,7 @@ Absolute click values contain a per-file clock-mapping bias; the meaningful resu
 | A file is flagged UNSTABLE/DRIFT while others are clean | File-specific presentation problem in that engine — distrust that file's absolute values |
 | YouTube M4A later than local controls by about +36–38 ms | Engine exposes the YouTube M4A raw AAC coordinate |
 | All 44.1 kHz files (YouTube M4A *and* `calibration-44k.m4a`) share a constant shift vs the 48 kHz controls | Engine's 44.1 kHz presentation constant: Firefox +0.7 ms, Chromium +1.5 ms, Safari ≈ −7 ms |
-| WebM/Opus ~+7.5 ms vs WAV in Firefox, ±0 in Chromium | Opus element-path offset (pre-skip class); production-irrelevant (YouTube mode = IFrame player, audio mode = M4A) |
+| WebM/Opus ~+7.5 ms vs WAV in Firefox, ±0 in Chromium | Opus element-path offset (pre-skip class); production-irrelevant today (YouTube mode = IFrame player, audio mode = M4A); relevant if Opus ever ships |
 | Corrected M4A earlier than the uncorrected one by ~36.3 ms | The engine honors the sync-time edit-list correction |
 | A B→C spacing near 8.733 s on a YouTube M4A in Safari | One-off mid-run mapping jump (recurs sporadically on uncorrected YouTube files); the windowed per-click mapping absorbs it — distrust that file's C reading, A readings remain valid |
 | `peak=0.00000` while playback is audible | WebKit silent-tap limitation: the media element's audio does not reach `createMediaElementSource` for that codec; a harness limitation, not a playback defect |
@@ -588,7 +588,7 @@ Firefox 155 macOS, full run with harness v3 (2026-09-06, shared 48 kHz AudioCont
 
 - The uncorrected YouTube M4A presents the raw coordinate (+37.0 ms), the corrected file is aligned within +0.7 ms — at click C as well, so there is no startup settling in Firefox.
 - Firefox's 44.1 kHz presentation constant is +0.7 ms (the local 44.1 kHz encode and the corrected file show it identically).
-- The WebM/Opus element path presents a constant **+7.5 ms** vs the WAV/M4A paths (all arms, all runs — Opus element-path offset; the offline decode of the same files is exact). Production-irrelevant: YouTube mode uses the IFrame player with its own A/V sync, audio mode ships M4A.
+- The WebM/Opus element path presents a constant **+7.5 ms** vs the WAV/M4A paths (all arms, all runs — Opus element-path offset; the offline decode of the same files is exact). Production-irrelevant today; relevant if Opus ever ships.
 - Spacings are exact (A→B 0.310000 s, B→C 8.690000 s).
 
 ### Chromium
@@ -636,7 +636,7 @@ Findings:
 - Safari still has sporadic mid-run mapping jumps (run 2: the 44k local's A→B spacing collapsed to 0.293 s; the corrected file logged a −124 ms early→late drift while keeping A and C self-consistent via the windowed mapping; the uncorrected files occasionally glitch click C to B→C = 8.733 s). These are presentation/reporting hiccups of the engine, not file defects — the same files measure cleanly in Firefox/Chromium and in FFmpeg decode.
 - Safari reports 60.022 s for all YouTube M4A files (including the corrected one) — duration derives from the raw media span with Safari's own end-trim, not from the edit list (cosmetic).
 
-WebM/Opus in Safari: the media element's output does not reach the Web Audio tap (silent tap: `peak=0.00000` while clicks are audible) — a harness limitation, not a playback defect; element durations are correct. This confirms that WebKit bug 293310 is specific to the **Ogg** container. Seek accuracy for WebM/Opus in Safari is not measurable with this harness.
+WebM/Opus in Safari: the media element's output does not reach the Web Audio tap (silent tap: `peak=0.00000` while clicks are audible) — a harness limitation, not a playback defect; element durations are correct. This confirms that WebKit bug 293310 is specific to the **Ogg** container. Seek/currentTime accuracy for WebM/Opus in Safari is not measurable with this harness until the silent tap is fixed — that measurement is the remaining gate for shipping Opus in dist again.
 
 ### Safari iOS
 
@@ -696,10 +696,10 @@ The clean proof that the shift is sample-rate-dependent: the local 44.1 kHz enco
 ### Timestamp authoring policy (final)
 
 1. **Canonical coordinate: the source PCM timeline.** It is presented identically by the uploaded video (and hence the YouTube IFrame player, which keeps its Opus audio rendition in A/V sync with the video track), by YouTube's Opus/WebM download, by locally encoded files, and by the corrected YouTube M4A. Marks authored against any of these artifacts are mutually valid without conversion. Marks read from an *uncorrected* YouTube M4A sit +36.3 ms late relative to source and would need `t_src = t_m4a − 0.0363`; the pipeline avoids that case by correcting the artifact instead.
-2. **YouTube pieces: correct the artifact once at sync time.** Download the M4A (itag 140), then `ffmpeg -itsoffset -0.0362812 -i <download>.m4a -c:a copy audio/<key>.m4a`; verify with `scripts/dump-elst.py` (`media_time=1600`) and `scripts/extract-clicks.py` (0.0 ms). Author timestamps against the corrected M4A or the WebM download in Audacity — both expose the source coordinate. Legacy marks authored against Opus artifacts are already source-aligned and remain valid unchanged.
+2. **YouTube pieces: keep two local files per piece, ship one.** `sync-media` downloads both renditions: the Opus/WebM (itag 251) and the AAC/M4A (itag 140), and corrects the M4A at sync time (`ffmpeg -itsoffset -0.0362812 -i <download>.m4a -c:a copy audio/<key>.m4a`; verify with `scripts/dump-elst.py` (`media_time=1600`) and `scripts/extract-clicks.py` (0.0 ms)). The layout in `audio/` is `<key>.webm` + `<key>.m4a`: the WebM is the **authoring reference** — YouTube's highest-quality audio track, source-aligned without any processing — and doubles as the cross-correlation baseline for the pipeline guard; the corrected M4A is the **playback artifact** and the only file that ships (the staging/bundle step must filter by extension: `<key>.m4a` + peaks JSON into `dist-audio/`, never the `.webm`). **Author timestamps against the WebM in Audacity**; use the corrected M4A when verifying how a mark plays. Legacy marks authored against Opus artifacts are already source-aligned and remain valid unchanged.
 3. Record which artifact and coordinate system a piece's marks belong to in the piece JSON5 (see the `authoring` provenance object in the piece format spec), so future format changes remain documented constant shifts rather than archaeology.
-4. Ogg/Opus remains disabled for production on WebKit (bug 293310). The experimental Opus pipeline is preserved behind the `AUDIO_FORMAT` build/sync profile and may be re-evaluated when Safari reports a correct `HTMLMediaElement.duration` and correct seeks for the Ogg/Opus calibration fixture.
+4. Ogg/Opus remains disabled for production on WebKit (bug 293310). The Opus pipeline may be re-evaluated when Safari (a) reports a correct `HTMLMediaElement.duration` and correct seeks for the Ogg/Opus fixture, or — for shipping Opus-in-**WebM** via the element — (b) once the silent-tap limitation is resolved and the harness can verify WebM/Opus seek and `currentTime` accuracy in Safari. Until then, M4A is the shipped format.
 5. The +36.3 ms offset and its correction are specific to YouTube's AAC rendition. Own recordings encoded locally with FFmpeg (`media-in` pipeline) are source-aligned in all engines and need no correction.
 6. The same piece JSON drives both player modes, and both are now source-aligned: the YouTube IFrame player via its Opus rendition and A/V sync, the audio mode via the corrected M4A. The only residuals are the documented per-engine 44.1 kHz presentation constants (worst case ≈ −7 ms on Safari — constant, sub-frame at the typical 25 fps of score videos, and inside the 0.01 s budget), so the player needs no runtime offset or browser detection.
 
-MP4/AAC is the canonical production format. Its only timing deviation — the constant, measurable, well-understood +36.3 ms YouTube rendition offset — is corrected once at sync time by a lossless edit-list remux, so JSON timestamps, precomputed peaks, Audacity authoring, and both player modes all share the source coordinate.
+MP4/AAC is the canonical **shipping format**; Opus/WebM is kept locally as the authoring reference and guard baseline. The M4A's only timing deviation — the constant, measurable, well-understood +36.3 ms YouTube rendition offset — is corrected once at sync time by a lossless edit-list remux, so JSON timestamps, precomputed peaks, Audacity authoring, and both player modes all share the source coordinate.
