@@ -1,6 +1,6 @@
 # Audio timeline calibration fixtures
 
-This directory contains reproducible source fixtures for validating the time-coordinate chain used by ProbeNavigator:
+This directory contains reproducible source fixtures for validating the time-coordinate chain used by *tutti-attacca*:
 
 ```text
 known PCM timeline
@@ -609,7 +609,7 @@ WebM/Opus measurements:
 | `yt_calibration-aac.webm` | 60.021 s | peak 0.00000, no clicks detected |
 | `yt_calibration-opus.webm` | 60.041 s | peak 0.00000, no clicks detected |
 
-The clicks were **audible** through the speakers while the Web Audio tap reported digital silence. This is the WebKit silent-tap limitation: for WebM/Opus the media element's output does not reach `createMediaElementSource`, even though playback itself works. It does not affect ProbeNavigator, which plays the element directly and draws the waveform from precomputed peaks rather than tapping the element through Web Audio.
+The clicks were **audible** through the speakers while the Web Audio tap reported digital silence. This is the WebKit silent-tap limitation: for WebM/Opus the media element's output does not reach `createMediaElementSource`, even though playback itself works. It does not affect *tutti-attacca*, which plays the element directly and draws the waveform from precomputed peaks rather than tapping the element through Web Audio.
 
 The WebM element durations are correct (matching ffprobe within a few ms). This confirms that WebKit bug 293310 is specific to the **Ogg** container: the same Opus stream in WebM presents a correct duration in Safari. Seek accuracy for WebM/Opus in Safari could not be measured with this harness because of the silent tap.
 
