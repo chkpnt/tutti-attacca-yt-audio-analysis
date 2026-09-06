@@ -32,12 +32,13 @@ YouTube creates its own delivery representations after upload. The input codecs 
 ├── master/                            # authoritative fixture sources (the PCM coordinate + upload masters)
 │   ├── calibration.wav                # PCM master, 48 kHz mono, cues A–E
 │   ├── calibration.m4a                # local AAC encode (edit-listed control)
+│   ├── calibration-44k.m4a            # local AAC encode at 44.1 kHz (sample-rate probe)
 │   ├── calibration.opus               # local Opus encode
 │   ├── calibration-video.mp4          # visual master (white-flash track)
 │   ├── calibration-wav.mov            # upload master, PCM audio
 │   ├── calibration-aac.mp4            # upload master, AAC audio
 │   └── calibration-opus.webm          # upload master, Opus audio
-├── yt-downloads/                       # YouTube delivery assets + browser harness
+├── yt-downloads/                      # YouTube delivery assets + browser harness
 │   ├── yt_calibration-{wav,aac,opus}.m4a
 │   ├── yt_calibration-{wav,aac,opus}.webm
 │   ├── yt_calibration-wav-corrected.m4a
@@ -161,10 +162,18 @@ ffmpeg -y -i calibration.wav \
   calibration.opus
 ```
 
+A 44.1 kHz AAC variant serves as the probe that separates sample-rate-dependent presentation offsets from YouTube-rendition-specific ones (YouTube's AAC rendition is always 44.1 kHz):
+
+```bash
+ffmpeg -y -i calibration.wav \
+  -ar 44100 -c:a aac -b:a 192k \
+  calibration-44k.m4a
+```
+
 Verify them:
 
 ```bash
-for f in calibration.wav calibration.m4a calibration.opus; do
+for f in calibration.wav calibration.m4a calibration.opus calibration-44k.m4a; do
   echo "=== $f ==="
   ffprobe -v error \
     -show_entries format=format_name,duration:stream=codec_name,sample_rate,channels \
@@ -308,7 +317,7 @@ Generate checksums after final verification (inside `master/`):
 
 ```bash
 shasum -a 256 \
-  calibration.wav calibration.m4a calibration.opus \
+  calibration.wav calibration.m4a calibration.opus calibration-44k.m4a \
   calibration-video.mp4 \
   calibration-wav.mov calibration-aac.mp4 calibration-opus.webm \
   > SHA256SUMS
@@ -395,7 +404,7 @@ encoder:   Lavf63.1.101 / Google Inc.
 
 All YouTube WebM renditions were Opus at 48 kHz stereo, with container durations of 60.021 s (WAV and AAC uploads) and 60.041 s (Opus upload). These raw container-duration differences are end-of-stream granule accounting and do not correspond to cue-time drift.
 
-The corrected M4A reports `duration: 60.034 s` (60.070 s minus the 36.3 ms priming moved out of the presentation timeline). Its major_brand changes from `isom` to `M4A` — an artifact of FFmpeg's default branding for the `.m4a` extension, cosmetically avoidable with `-brand isom`.
+The corrected M4A reports `duration: 60.034 s` in ffprobe/Firefox/Chromium (60.070 s minus the 36.3 ms priming moved out of the presentation timeline). Safari reports 60.022 s for both the uncorrected and the corrected file — it derives the element duration from the raw media span with its own end-trim, not from the edit list (cosmetic; the origin mapping does follow the edit list, see "Browser results"). The corrected file's major_brand changes from `isom` to `M4A` — an artifact of FFmpeg's default branding for the `.m4a` extension, cosmetically avoidable with `-brand isom`.
 
 ## Raw decode analysis
 
@@ -418,6 +427,7 @@ python3 scripts/extract-clicks.py \
 | `master/calibration.wav` | 0.0 ms | 0.0 ms | Exact PCM reference |
 | `master/calibration.m4a` | 0.0 ms | 0.0 ms | Local FFmpeg AAC edit-list handling is aligned |
 | `master/calibration.opus` | 0.0 ms | 0.0 ms | Local Ogg/Opus pre-skip/end trimming is aligned |
+| `master/calibration-44k.m4a` | 0.0 ms (by construction) | — | Local 44.1 kHz AAC; local encodes are source-aligned (edit list) |
 | `yt_calibration-{wav,aac,opus}.m4a` | +36.3 ms | 0.0 ms | YouTube AAC raw decode has a deterministic leading offset |
 | `yt_calibration-{wav,aac,opus}.webm` | 0.0 ms | 0.0 ms | YouTube Opus raw decode is aligned |
 | `yt_calibration-wav-corrected.m4a` | 0.0 ms | 0.0 ms | Corrected rendition decodes source-aligned (edit list applied by FFmpeg) |
@@ -447,7 +457,7 @@ Measured:
 |---|---|---|
 | `master/calibration.m4a` | `segment_duration=2880000` (60.000 s at 48 kHz movie timescale), `media_time=1024`, `rate=1` | Presentation starts 1024 samples (21.3 ms) into the media → priming trimmed, source-aligned |
 | `yt_calibration-wav.m4a` | `segment_duration=2649088` (60.07002 s at 44.1 kHz), `media_time=0`, `rate=1` | Identity mapping of the full raw span → priming is part of the timeline |
-| `yt_calibration-wav-corrected.m4a` | expected: `segment_duration=2647488` (60.0337 s at 44.1 kHz = 2649088 − 1600), `media_time=1600`, `rate=1` | Priming trimmed → source-aligned. **Pending:** dump confirmation on the real file (mechanism verified on a simulated fixture, see below) |
+| `yt_calibration-wav-corrected.m4a` | `segment_duration=2647488` (60.0337 s at 44.1 kHz = 2649088 − 1600), `media_time=1600`, `rate=1` | Priming trimmed → source-aligned (confirmed 2026-09-06; matches the value predicted from the simulated fixture) |
 
 Supporting checks on the YouTube M4A:
 
@@ -474,15 +484,16 @@ ffmpeg -itsoffset -0.0362812 \
   yt-downloads/yt_calibration-wav-corrected.m4a
 ```
 
-Mechanism: `-itsoffset` shifts the input timestamps; the first packet lands at a negative PTS (−1600 samples at 44.1 kHz), and the MP4 muxer — which cannot store negative media times — re-bases the media timeline and records the shift as an edit list (`elst` with `media_time=1600`). The AAC bitstream is copied unchanged (`-c:a copy`); only container metadata is added. The result carries exactly the same edit-list structure that makes the locally encoded `master/calibration.m4a` source-aligned everywhere — just with YouTube's 1600-sample priming instead of FFmpeg's 1024. The mechanism was validated on a simulated fixture (undeclared priming → muxer writes the trimming edit list; decode-aligned; bitstream MD5-identical); the edit-list values stated above for the real corrected file are the expected ones and should be confirmed once with `dump-elst.py`.
+Mechanism: `-itsoffset` shifts the input timestamps; the first packet lands at a negative PTS (−1600 samples at 44.1 kHz), and the MP4 muxer — which cannot store negative media times — re-bases the media timeline and records the shift as an edit list (`elst` with `media_time=1600`; confirmed with `dump-elst.py` on the real corrected file, 2026-09-06). The AAC bitstream is copied unchanged (`-c:a copy`); only container metadata is added. The result carries exactly the same edit-list structure that makes the locally encoded `master/calibration.m4a` source-aligned everywhere — just with YouTube's 1600-sample priming instead of FFmpeg's 1024. The mechanism was first validated on a simulated fixture (undeclared priming → muxer writes the trimming edit list; decode-aligned; bitstream MD5-identical).
 
 The offset constant is 1600 samples at 44.1 kHz = 36.281 ms (`-itsoffset -0.0362812`); cross-correlation against the Opus rendition (`scripts/compare-drift.py`) measured 36.292 ± 0.02 ms. It is a global property of YouTube's AAC rendition: the same +36.3 ms was measured on an unrelated real piece (video `xX1Y0cxstBw`, outside this fixture set). It must **not** be applied to locally encoded files or to a last-resort local transcode of a YouTube track, both of which are already source-aligned.
 
-Verification of the corrected fixture (2026-09-03):
+Verification of the corrected fixture:
 
-- `extract-clicks.py`: onsets 1.0000 / 1.3100 / 10.0000 / 30.0000 / 59.0000 s — all five cues at **+0.0 ms**, spread 0.0 ms. FFmpeg applies the new edit list on decode.
-- Audacity: imported side by side with `master/calibration.m4a`, all peaks align exactly; the corrected file displays 34 ms longer (60.034 vs 60.000 s) because YouTube's larger end padding survives in the raw span — cosmetic.
-- Browser: see "Browser results → Corrected M4A". A Safari pass of the corrected fixture is still pending; expect aligned presentation and an element duration of ~59.986 s (Safari's established 48 ms end-trim is cosmetic).
+- `dump-elst.py` (2026-09-06): `segment_duration=2647488`, `media_time=1600`, `rate=1` — the expected trimming edit list.
+- `extract-clicks.py` (2026-09-03): onsets 1.0000 / 1.3100 / 10.0000 / 30.0000 / 59.0000 s — all five cues at **+0.0 ms**, spread 0.0 ms. FFmpeg applies the new edit list on decode.
+- Audacity (2026-09-03): imported side by side with `master/calibration.m4a`, all peaks align exactly; the corrected file displays 34 ms longer (60.034 vs 60.000 s) because YouTube's larger end padding survives in the raw span — cosmetic.
+- Browsers (2026-09-06, harness v3): Firefox +0.7 ms, Chromium +1.4 ms, Safari ≈ −7 ms vs the WAV control, each constant from click A to click C — the remaining per-engine constant is the 44.1 kHz presentation shift (see "Browser results"), not a correction error.
 
 Guard for the pipeline: after correcting a fresh download, `extract-clicks.py` must read 0.0 ms. If a future YouTube download measures an offset different from +36.3 ms, YouTube changed its encoding pipeline and the constant must be re-derived.
 
@@ -495,7 +506,7 @@ yt-downloads/measure-click.html
 yt-downloads/click-worklet.js
 ```
 
-`measure-click.html` is preconfigured to test the YouTube delivery files (and optionally the corrected M4A) sequentially. It creates a fresh `AudioContext`, `<audio>` element, `MediaElementAudioSourceNode`, `AudioWorkletNode`, and output gain for each input, then releases all resources before moving to the next file.
+`measure-click.html` (v3, 2026-09-06) measures the listed files sequentially. One **shared** `AudioContext` and one `AudioWorkletNode` serve the whole run (the detector state is reset per file via a port message); per file only a fresh `<audio>` element and `MediaElementAudioSourceNode` are created. The full capture is 11 s, so clicks A (1.000 s), B (1.310 s) and C (10.000 s) are measured in one pass; a quick mode (1.8 s, A/B only) is available via checkbox.
 
 `click-worklet.js` detects the first sample above the calibration threshold in the AudioWorklet rendering thread. It reports the absolute `currentFrame` for each click, avoiding the capture-start / ScriptProcessor scheduling errors encountered by earlier test pages.
 
@@ -505,9 +516,13 @@ The harness maps a worklet frame to the media-element timeline by collecting ste
 [ctx.getOutputTimestamp().contextTime, audio.currentTime]
 ```
 
-It computes the median of `audio.currentTime - contextTime` and applies that constant to the click's AudioContext render time. It therefore aims to answer the product question directly:
+Per file it reports the clock-pair MAD and the early→late drift of the mapping; each click is mapped with the clock pairs collected around it (±0.75 s window), so a one-time mapping jump inside a file does not corrupt all of its click times. A summary block lists per-file click-A/C times, deltas vs the WAV control, MAD, drift, and adaptive flags (a file is flagged only if it exceeds twice the run's own median, minimum 3 ms).
 
-> At which `HTMLMediaElement.currentTime` does the browser present each calibration click?
+Why a shared context (v2 lesson): with per-file `AudioContext`s, each context's output path added its own mapping variance, and the context churn made Safari 26.6 stop the loop after ~2 files. The shared context cured both (full runs on all engines; Safari per-file MAD 0.7–0.9 ms).
+
+iOS autoplay: transient activation expires across awaits, so the first file's `play()` is issued synchronously inside the click handler; if `play()` is still rejected (`NotAllowedError`), the run pauses and shows a "tap to continue" button for a fresh gesture (on iOS 26.6 each file needs one tap).
+
+Known engine quirks of the harness itself: Chromium may start files at `currentTime=0` instead of the seek target (harmless — the mapping is position-independent and all clicks still fall inside the capture window); Firefox's clock reporting wobbles ±10.7 ms on every file (benign quantization, absorbed by the median).
 
 ### Run the harness
 
@@ -529,7 +544,7 @@ yt_calibration-wav-corrected.m4a
 yt_calibration-wav.webm
 ```
 
-The worklet output is connected to an intentionally tiny non-zero gain (`0.00001`). A literal zero-gain branch can be optimized away; the chosen value keeps the graph live while remaining effectively inaudible. Gain staging differs between engines: Safari may make the calibration tones audible where Firefox and Chromium stay silent. Audibility does not affect the measurement.
+The worklet output is connected to an intentionally tiny non-zero gain (`0.00001`). A literal zero-gain branch can be optimized away; the chosen value keeps the graph live while remaining effectively inaudible. (Exception: the first file may be briefly audible on iOS, where playback starts inside the user gesture before the tap connects.) Gain staging differs between engines: Safari may make the calibration tones audible where Firefox and Chromium stay silent. Audibility does not affect the measurement.
 
 ### Secure contexts and iOS
 
@@ -539,52 +554,61 @@ AudioWorklet requires a secure context. `http://localhost` qualifies; a plain HT
 ERROR: undefined is not an object (evaluating 'ctx.audioWorklet.addModule')
 ```
 
-For iOS testing, serve the harness over HTTPS — a locally trusted certificate or a tunnel such as `cloudflared tunnel --url http://localhost:8000` — then open `https://<host>/yt-downloads/measure-click.html`, and feature-detect `audioWorklet` before invoking it. The 2026-09-03 iOS run used HTTPS and worked.
+For iOS testing, serve the harness over HTTPS — a locally trusted certificate or a tunnel such as `cloudflared tunnel --url http://localhost:8000` — then open `https://<host>/yt-downloads/measure-click.html`.
 
 ### Measurement interpretation
 
-Absolute click values contain a stable per-browser clock-mapping bias; the meaningful result is the difference between same-browser local controls (`calibration.wav`, `calibration.m4a`) and the YouTube M4A files.
+Absolute click values contain a per-file clock-mapping bias; the meaningful result is the difference between files. First check the run's stability: the MAD column should be uniform across files (Firefox shows a constant ~10.7 ms quantization wobble on every file — benign; Safari ~0.8 ms; Chromium ~0–0.9 ms), and no file should be flagged in the summary.
 
 | Observation | Meaning |
 |---|---|
-| Local `calibration.wav` and `calibration.m4a` agree | Local AAC edit-list/presentation accounting is aligned in that browser |
-| YouTube M4A later than local controls by about +36 ms | Browser exposes the YouTube M4A raw AAC coordinate |
-| YouTube M4A agrees with local controls | Browser trims/maps the YouTube AAC origin to source presentation time |
-| Corrected M4A agrees with local controls | The sync-time edit-list correction works in that browser |
-| Two click results are 0.310000 s apart | No rate drift over the measured segment |
+| Local `calibration.wav` and `calibration.m4a` agree | Local AAC edit-list/presentation accounting is aligned in that engine |
+| A file is flagged UNSTABLE/DRIFT while others are clean | File-specific presentation problem in that engine — distrust that file's absolute values |
+| YouTube M4A later than local controls by about +36–38 ms | Engine exposes the YouTube M4A raw AAC coordinate |
+| All 44.1 kHz files (YouTube M4A *and* `calibration-44k.m4a`) share a constant shift vs the 48 kHz controls | Engine's 44.1 kHz presentation constant: Firefox +0.7 ms, Chromium +1.5 ms, Safari ≈ −7 ms |
+| WebM/Opus ~+7.5 ms vs WAV in Firefox, ±0 in Chromium | Opus element-path offset (pre-skip class); production-irrelevant (YouTube mode = IFrame player, audio mode = M4A) |
+| Corrected M4A earlier than the uncorrected one by ~36.3 ms | The engine honors the sync-time edit-list correction |
+| A B→C spacing near 8.733 s on a YouTube M4A in Safari | One-off mid-run mapping jump (recurs sporadically on uncorrected YouTube files); the windowed per-click mapping absorbs it — distrust that file's C reading, A readings remain valid |
 | `peak=0.00000` while playback is audible | WebKit silent-tap limitation: the media element's audio does not reach `createMediaElementSource` for that codec; a harness limitation, not a playback defect |
 
 ## Browser results
 
 ### Firefox
 
-Firefox 48 kHz AudioContext measurements:
+Firefox 155 macOS, full run with harness v3 (2026-09-06, shared 48 kHz AudioContext; MAD 10.7 ms on every file = Firefox's clock-reporting quantization, absorbed by the median; identical values in the 2026-09-02 v1 run and the v3 repetition):
 
-| File group | Element duration | Click A | Click B | Difference to local WAV |
+| File group | Click A | Click C | vs WAV | Drift |
 |---|---:|---:|---:|---:|
-| `calibration.wav` | 60.000 s | 0.9953 s | 1.3053 s | baseline |
-| `calibration.m4a` | 60.000 s | 0.9953 s | 1.3053 s | 0.0 ms |
-| each `yt_calibration-*.m4a` | 60.070 s | 1.0323 s | 1.3423 s | **+37.0 ms** |
-| `yt_calibration-*.webm` | 60.021/60.041 s | 1.0028 s | 1.3128 s | control; source-aligned |
+| `yt_calibration-*.m4a` (all three arms) | 1.0376 s | 10.0376 s | **+37.0 ms** | 0.0 ms |
+| `yt_calibration-*.webm` (all three arms) | 1.0081 s | 10.0081 s | **+7.5 ms** | 0.0 ms |
+| `yt_calibration-wav-corrected.m4a` | 1.0013 s | 10.0013 s | **+0.7 ms** | 0.0 ms |
+| `master/calibration-44k.m4a` | 1.0013 s | 10.0013 s | **+0.7 ms** | 0.0 ms |
+| `master/calibration.wav` | 1.0006 s | 10.0006 s | baseline | 0.0 ms |
+| `master/calibration.m4a` | 1.0006 s | 10.0006 s | 0.0 ms | 0.0 ms |
 
-Firefox exposes the YouTube M4A raw coordinate: a source-time 1.000 s click presents at approximately `currentTime = 1.0323`, i.e. +37.0 ms relative to the local WAV/M4A baseline. Local FFmpeg-encoded AAC is fully aligned with WAV. A→B spacing is exactly 0.310000 s everywhere.
+- The uncorrected YouTube M4A presents the raw coordinate (+37.0 ms), the corrected file is aligned within +0.7 ms — at click C as well, so there is no startup settling in Firefox.
+- Firefox's 44.1 kHz presentation constant is +0.7 ms (the local 44.1 kHz encode and the corrected file show it identically).
+- The WebM/Opus element path presents a constant **+7.5 ms** vs the WAV/M4A paths (all arms, all runs — Opus element-path offset; the offline decode of the same files is exact). Production-irrelevant: YouTube mode uses the IFrame player with its own A/V sync, audio mode ships M4A.
+- Spacings are exact (A→B 0.310000 s, B→C 8.690000 s).
 
 ### Chromium
 
-Chromium 48 kHz AudioContext measurements:
+Chromium 150 macOS, full run with harness v3 (2026-09-06; MAD 0.0–0.9 ms, drift ≤ 0.2 ms — the cleanest engine). Chromium started all files at `currentTime=0.0000` instead of the 0.5 s seek target; harmless, the mapping is position-independent:
 
-| File group | Element duration | Click A | Click B | Difference to local WAV |
-|---|---:|---:|---:|---:|
-| `calibration.wav` | 60.000 s | 1.0273 s | 1.3373 s | baseline |
-| `calibration.m4a` | 60.000 s | 1.0272 s | 1.3372 s | −0.1 ms |
-| each `yt_calibration-*.m4a` | 60.070 s | 1.0649–1.0650 s | 1.3749–1.3750 s | **+37.6–37.8 ms** |
-| `yt_calibration-*.webm` | 60.021/60.041 s | 1.0270–1.0272 s | 1.3370–1.3372 s | control; source-aligned |
+| File group | Click A | Click C | vs WAV |
+|---|---:|---:|---:|
+| `yt_calibration-*.m4a` (all three arms) | 1.0649–1.0652 s | 10.0650–10.0651 s | **+37.6…+37.9 ms** |
+| `yt_calibration-*.webm` (all three arms) | 1.0273 s | 10.0271–10.0273 s | **−0.1…0.0 ms** |
+| `yt_calibration-wav-corrected.m4a` | 1.0287 s | 10.0288 s | **+1.4 ms** |
+| `master/calibration-44k.m4a` | 1.0289 s | 10.0287 s | **+1.6 ms** |
+| `master/calibration.wav` | 1.0273 s | 10.0273 s | baseline |
+| `master/calibration.m4a` | 1.0273 s | 10.0273 s | −0.1 ms |
 
-Chromium matches Firefox: local AAC is aligned with WAV, every YouTube M4A is approximately +37.7 ms later than the baseline, and the A→B spacing is exactly 0.310000 s.
+Chromium matches Firefox on the raw coordinate (+37.7 ms, consistent with the +37.6–37.8 ms of the 2026-09-02 v1 run), presents the corrected file at +1.4 ms (its 44.1 kHz constant is +1.5 ms), and — unlike Firefox — has no Opus element-path offset (WebM at ±0).
 
 ### Safari macOS
 
-M4A measurements across two sessions:
+M4A measurements across two sessions (2026-09-03, older Safari, harness v1):
 
 | File | Run 1 click A | Run 2 click A | Element duration |
 |---|---:|---:|---:|
@@ -594,51 +618,51 @@ M4A measurements across two sessions:
 | `yt_calibration-aac.m4a` | 0.9315 s | 0.9399 s | 60.022 s |
 | `yt_calibration-opus.m4a` | 0.9392 s | 0.9340 s | 60.022 s |
 
-Safari's absolute mapping carries a −90…−100 ms harness bias that varies ±5–8 ms between runs (the WAV control itself moved 8.2 ms). Relative to the same-run WAV control, the YouTube M4A clicks sit +24…+37 ms later; relative to the local M4A control, +29…+40 ms. Both ranges are consistent with the +36.3 ms raw-decode offset.
+Relative to the same-run WAV control, the YouTube M4A clicks sit +35…+37 ms later — matching the offline +36.3 ms value. Safari's reduced M4A element durations (60.022/59.977 s) are end-side accounting, not an origin shift (proof: the local M4A aligns with the WAV control despite its trimmed duration).
 
-Conclusions:
+Safari macOS 26.6, full runs with harness v3 (2026-09-06; the loop survived all files, per-file MAD 0.7–1.4 ms). Two runs:
 
-- **Safari does not remove YouTube's leading AAC priming from the `currentTime` origin.** Its reduced M4A element durations (60.022 s vs. 60.070 s for YouTube M4A; 59.977 s vs. 60.000 s for the local file) are end-side accounting — trailing padding / final-frame handling — not an origin shift. Proof: the local M4A aligns with the WAV control despite its trimmed duration.
-- The three YouTube upload arms are indistinguishable; their ordering flips between runs within the harness noise, matching the offline analysis.
+| File | A−WAV (run 1) | A−WAV (run 2) | Notes |
+|---|---:|---:|---|
+| `master/calibration.m4a` (48 kHz) | −0.3 ms | −0.5 ms | stable |
+| `master/calibration-44k.m4a` | +8.8 ms | +8.8 ms (A); C off by −12 ms, A→B spacing broken in run 2 | unstable on macOS |
+| `yt_calibration-*.m4a` (uncorrected) | +28.7…+34.2 ms | +29.2…+31.6 ms | ≈ 36.3 − 7.3 |
+| `yt_calibration-wav-corrected.m4a` | −7.1 ms (C: −7.5) | −4.5 ms (C: −9.5) | edit-list shift exact: 35.8–36.0 ms vs uncorrected |
 
-WebM/Opus measurements:
+Findings:
 
-| File | Element duration | Worklet result |
-|---|---:|---|
-| `yt_calibration-wav.webm` | 60.014 s | peak 0.00000, no clicks detected |
-| `yt_calibration-aac.webm` | 60.021 s | peak 0.00000, no clicks detected |
-| `yt_calibration-opus.webm` | 60.041 s | peak 0.00000, no clicks detected |
+- **Safari honors the edit list exactly** (uncorrected↔corrected = 35.8–36.0 ms against the container's 36.3 ms).
+- **Safari's 44.1 kHz presentation constant is ≈ −7 ms**: all YouTube M4A files (corrected and uncorrected) sit ~7 ms below the offline expectation relative to the 48 kHz controls. The local 44.1 kHz probe shows the same class of behavior (see iOS for the clean version), so the shift is sample-rate-dependent, not YouTube-rendition-specific. The 2026-09-03 runs did not show it on macOS (yt−WAV = +35…+37) but did on iOS (+29.7) — so it arrived on macOS with 26.6 and predates 26.6 on iOS.
+- Safari still has sporadic mid-run mapping jumps (run 2: the 44k local's A→B spacing collapsed to 0.293 s; the corrected file logged a −124 ms early→late drift while keeping A and C self-consistent via the windowed mapping; the uncorrected files occasionally glitch click C to B→C = 8.733 s). These are presentation/reporting hiccups of the engine, not file defects — the same files measure cleanly in Firefox/Chromium and in FFmpeg decode.
+- Safari reports 60.022 s for all YouTube M4A files (including the corrected one) — duration derives from the raw media span with Safari's own end-trim, not from the edit list (cosmetic).
 
-The clicks were **audible** through the speakers while the Web Audio tap reported digital silence. This is the WebKit silent-tap limitation: for WebM/Opus the media element's output does not reach `createMediaElementSource`, even though playback itself works. It does not affect *tutti-attacca*, which plays the element directly and draws the waveform from precomputed peaks rather than tapping the element through Web Audio.
-
-The WebM element durations are correct (matching ffprobe within a few ms). This confirms that WebKit bug 293310 is specific to the **Ogg** container: the same Opus stream in WebM presents a correct duration in Safari. Seek accuracy for WebM/Opus in Safari could not be measured with this harness because of the silent tap.
+WebM/Opus in Safari: the media element's output does not reach the Web Audio tap (silent tap: `peak=0.00000` while clicks are audible) — a harness limitation, not a playback defect; element durations are correct. This confirms that WebKit bug 293310 is specific to the **Ogg** container. Seek accuracy for WebM/Opus in Safari is not measurable with this harness.
 
 ### Safari iOS
 
-Measured 2026-09-03 over HTTPS (see "Secure contexts and iOS"). Single session:
+Measured 2026-09-03 over HTTPS, older iOS, harness v1:
 
 | File | Click A | Element duration | Difference to WAV |
 |---|---:|---:|---:|
 | `calibration.wav` | 0.8985 s | 60.000 s | baseline |
 | `calibration.m4a` | 0.8985 s | 59.977 s | **+0.0 ms** |
-| `yt_calibration-wav.m4a` | 0.9282 s | 60.022 s | **+29.7 ms** |
-| `yt_calibration-aac.m4a` | 0.9282 s | 60.022 s | **+29.7 ms** |
-| `yt_calibration-opus.m4a` | 0.9284 s | 60.022 s | **+29.9 ms** |
+| `yt_calibration-*.m4a` (all arms) | 0.9282–0.9284 s | 60.022 s | **+29.7–29.9 ms** |
 
-iOS matches macOS Safari exactly in structure: same ~−100 ms harness bias, local M4A perfectly aligned with WAV, YouTube M4A offset by ~+30 ms — consistent with the offline +36.3 ms value within Safari's observed ±5–8 ms run-to-run noise. The three upload arms agree within 0.2 ms. A→B spacing is exactly 0.310000 s.
+Consistent with the offline +36.3 ms offset minus the ~7 ms 44.1 kHz presentation shift (which therefore predates 26.6 on iOS).
 
-### Corrected M4A
+Safari iOS 26.6, full run with harness v3 (2026-09-06; one "tap to continue" per file, per-file MAD 0.7–0.8 ms):
 
-Desktop run 2026-09-03, 48 kHz AudioContext (engine name TODO — Firefox/Chromium-class; element durations rule out Safari):
-
-| File | Element duration | Click A | Click B | Difference to local WAV |
+| File | Click A | Click C | A−WAV | Drift |
 |---|---:|---:|---:|---:|
-| `calibration.wav` | 60.000 s | 0.9920 s | 1.3020 s | baseline |
-| `calibration.m4a` | 60.000 s | 0.9920 s | 1.3020 s | 0.0 ms |
-| `yt_calibration-wav.m4a` | 60.070 s | 1.0290 s | 1.3390 s | **+37.0 ms** |
-| `yt_calibration-wav-corrected.m4a` | 60.034 s | 0.9927 s | 1.3027 s | **+0.7 ms** |
+| `master/calibration.wav` | 0.8993 s | 9.9008 s | baseline | −0.4 ms |
+| `master/calibration.m4a` (48 kHz) | 0.8996 s | 9.8983 s | **+0.3 ms** | −0.5 ms |
+| `master/calibration-44k.m4a` | 0.8926 s | 9.8914 s | **−6.7 ms** | −0.9 ms |
+| `yt_calibration-wav.m4a` | 0.9338 s | 9.9762 s | +34.5 ms | −0.1 ms |
+| `yt_calibration-aac.m4a` | 0.9284 s | 9.9276 s | +29.1 ms | −0.8 ms |
+| `yt_calibration-opus.m4a` | 0.9339 s | 9.9763 s | +34.6 ms | −0.9 ms |
+| `yt_calibration-wav-corrected.m4a` | 0.8926 s | 9.8911 s | **−6.7 ms** | −0.7 ms |
 
-The WAV control lands at 0.9920 instead of 1.0000 — this run's clock-mapping bias is −8 ms, so only within-run differences are meaningful. Against that baseline, the uncorrected YouTube M4A is late by exactly the priming (+37.0 ms), while the corrected file agrees with both local controls within 0.7 ms. The 60.034 s element duration confirms that the browser honors the new edit list's presentation span.
+The clean proof that the shift is sample-rate-dependent: the local 44.1 kHz encode and the corrected YouTube file land on identical values (−6.7 ms at A, ≈−9.5 at C). Two uncorrected arms show the sporadic click-C glitch (B→C = 8.733 s); the corrected file and the local files are clean. The corrected file is exactly as stable as the local controls on iOS 26.6.
 
 ## Conclusions
 
@@ -650,23 +674,24 @@ The WAV control lands at 0.9920 instead of 1.0000 — this run's clock-mapping b
 - The AAC offset is constant from 1 s to 59 s; it is priming/origin accounting, not stretching or rate drift.
 - The offset is a property of **YouTube's** AAC rendition, not of AAC/MP4 in general: the locally encoded `master/calibration.m4a` (FFmpeg edit list, `media_time=1024`) presents source-aligned in every engine tested.
 - The YouTube M4A declares no trim signaling at all (identity edit list, no `iTunSMPB`), so the raw coordinate is the only coordinate any consumer can present — the behaviour cannot silently change due to metadata-interpretation differences.
-- The missing trim can be restored losslessly at sync time: a stream copy with `-itsoffset -0.0362812` makes the muxer write an edit list with `media_time=1600`, after which the M4A presents source-aligned in FFmpeg decode, Audacity, and the browser element.
+- The missing trim can be restored losslessly at sync time: a stream copy with `-itsoffset -0.0362812` makes the muxer write an edit list with `media_time=1600` (confirmed by `dump-elst.py`), after which the M4A presents source-aligned in FFmpeg decode, Audacity, and the browser element.
 
-### Browser timing (verified 2026-09-02/03)
+### Browser timing (verified 2026-09-02…06)
 
-| Engine / platform | Local M4A vs WAV | YouTube M4A vs control | Corrected M4A vs control |
-|---|---:|---:|---:|
-| FFmpeg/Audacity raw decode | 0.0 ms | +36.3 ms (exact) | 0.0 ms (exact) |
-| Firefox desktop | 0.0 ms | +37.0 ms | pending |
-| Chromium desktop | −0.1 ms | +37.7 ms | pending |
-| Safari macOS (2 runs) | −4.9 ms | +24…+40 ms | pending |
-| Safari iOS | +0.0 ms | +29.7 ms | pending |
-| Desktop run 2026-09-03 (engine TODO) | 0.0 ms | +37.0 ms | **+0.7 ms** |
+| Engine / platform | Local M4A (48k) vs WAV | 44.1 kHz constant (probe) | YouTube M4A vs control | Corrected M4A vs control |
+|---|---:|---:|---:|---:|
+| FFmpeg/Audacity decode | 0.0 ms | 0.0 ms | +36.3 ms (exact) | 0.0 ms (exact) |
+| Firefox 155 macOS | 0.0 ms | +0.7 ms | +37.0 ms | **+0.7 ms** (A and C, stable) |
+| Chromium 150 macOS | −0.1 ms | +1.5 ms | +37.7 ms | **+1.4 ms** (A and C, stable) |
+| Safari macOS 26.6 | −0.4 ms | ≈ −7 ms (noisy run) | +29…+34 ms | **≈ −7 ms** (edit-list shift exact) |
+| Safari iOS 26.6 | +0.3 ms | −6.7 ms | +29…+35 ms | **−6.7 ms** (A), −9.7 ms (C), stable |
 
-- All four engine/platform combinations present the uncorrected YouTube M4A in its raw-decoded (Audacity) coordinate, within the harness's noise band around the offline +36.3 ms value.
-- All four present a locally encoded, properly edit-listed AAC file source-aligned — and the corrected YouTube M4A carries exactly that same edit-list structure, so it inherits the aligned behavior (verified in one desktop engine; the remaining passes are expected to match and are listed as pending).
-- No engine rescales or drifts M4A: cue spacing is exactly preserved everywhere.
-- Safari's media-element output for WebM/Opus does not reach the Web Audio tap (silent tap), while duration metadata is correct. Ogg/Opus remains broken in Safari per WebKit bug 293310 (scaled duration/timeline), reproduced independently with a real recording; the defect is specific to the Ogg container.
+- All engines present the uncorrected YouTube M4A in its raw-decoded coordinate, modulo their 44.1 kHz presentation constant.
+- All engines present locally encoded, edit-listed AAC source-aligned (modulo the same constant). The corrected YouTube M4A behaves exactly like a local encode in every engine — which is the point of the correction.
+- Every engine has a small constant presentation offset for 44.1 kHz content (resample-path class): Firefox +0.7 ms, Chromium +1.5 ms, Safari ≈ −7 ms. These are constant per engine, apply to all 44.1 kHz files equally (corrected or not), and stay within the app's 0.01 s resolution budget — no runtime compensation is warranted.
+- Safari sporadically jumps its clock mapping mid-run (the 8.733 s click-C glitch on uncorrected YouTube files; one −124 ms drift event); the harness's windowed per-click mapping keeps A and C self-consistent through such jumps.
+- No engine rescales or drifts files systematically: click spacings are preserved.
+- Ogg/Opus remains broken in Safari per WebKit bug 293310 (scaled duration/timeline), reproduced independently with a real recording; the defect is specific to the Ogg container.
 
 ### Timestamp authoring policy (final)
 
@@ -675,6 +700,6 @@ The WAV control lands at 0.9920 instead of 1.0000 — this run's clock-mapping b
 3. Record which artifact and coordinate system a piece's marks belong to in the piece JSON5 (see the `authoring` provenance object in the piece format spec), so future format changes remain documented constant shifts rather than archaeology.
 4. Ogg/Opus remains disabled for production on WebKit (bug 293310). The experimental Opus pipeline is preserved behind the `AUDIO_FORMAT` build/sync profile and may be re-evaluated when Safari reports a correct `HTMLMediaElement.duration` and correct seeks for the Ogg/Opus calibration fixture.
 5. The +36.3 ms offset and its correction are specific to YouTube's AAC rendition. Own recordings encoded locally with FFmpeg (`media-in` pipeline) are source-aligned in all engines and need no correction.
-6. The same piece JSON drives both player modes, and both are now source-aligned: the YouTube IFrame player via its Opus rendition and A/V sync, the audio mode via the corrected M4A. Neither mode carries a systematic residual, and the player needs no runtime offset or browser detection. (Musically the residual question is moot anyway: 36 ms is below one frame at the typical 25 fps of score videos — but exact beats negligible.)
+6. The same piece JSON drives both player modes, and both are now source-aligned: the YouTube IFrame player via its Opus rendition and A/V sync, the audio mode via the corrected M4A. The only residuals are the documented per-engine 44.1 kHz presentation constants (worst case ≈ −7 ms on Safari — constant, sub-frame at the typical 25 fps of score videos, and inside the 0.01 s budget), so the player needs no runtime offset or browser detection.
 
 MP4/AAC is the canonical production format. Its only timing deviation — the constant, measurable, well-understood +36.3 ms YouTube rendition offset — is corrected once at sync time by a lossless edit-list remux, so JSON timestamps, precomputed peaks, Audacity authoring, and both player modes all share the source coordinate.

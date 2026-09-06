@@ -5,6 +5,7 @@
 <style>
   body { font: 14px/1.4 -apple-system, sans-serif; margin: 1em; }
   textarea { display: block; width: min(100%, 40em); height: 8em; font: inherit; }
+  label { display: block; margin-top: 0.5em; }
   button { margin: 0.75em 0; }
   pre { background: #f4f4f4; padding: 1em; white-space: pre-wrap; }
 </style>
@@ -19,154 +20,193 @@ yt_calibration-opus.m4a
 yt_calibration-opus.webm
 ../master/calibration.wav
 ../master/calibration.m4a
-</textarea>
+../master/calibration-44k.m4a</textarea>
+<label><input type="checkbox" id="quick"> Quick mode (1.8 s capture, clicks A+B only)</label>
 <button id="go">Measure all</button>
 <pre id="log"></pre>
 
 <script type="module">
 // Measures the HTMLMediaElement presentation time of the 1 kHz calibration
-// clicks for every listed file. The source PCM timeline defines clicks A/B at
-// 1.000 and 1.310 seconds respectively.
+// clicks for every listed file. The source PCM timeline defines clicks A/B/C
+// at 1.000 / 1.310 / 10.000 seconds.
 //
-// The actual product question is deliberately narrow:
+// The product question: does a browser present the YouTube AAC rendition at
+// the raw coordinate (click A at 1.0363) or at the source coordinate — and
+// does the edit-list-corrected M4A present at the source coordinate?
 //
-//   If audio.currentTime = 1.000, does the browser present the source click
-//   immediately, or does a YouTube AAC raw-decode priming offset (+36.3 ms)
-//   move it to 1.0363?
-//
-// The local/yt-dlp fixture analysis established:
-//
-//   yt_calibration-*.webm -> source PCM click positions (0.0 ms raw offset)
-//   yt_calibration-*.m4a  -> +36.3 ms raw-decode offset, no rate drift
-//
-// This page tests browser *media-element* semantics, not an ffmpeg decode,
-// Audacity import, or decodeAudioData() buffer. It follows the media through
-// the createMediaElementSource() Web Audio path used to observe output samples.
-//
-// Measurement design for each file:
-//
+// Measurement design per file:
 // 1. click-worklet.js identifies a click at an exact AudioContext render frame.
-// 2. While playback is steady, the page samples (render time, currentTime)
-//    pairs via getOutputTimestamp().
-// 3. Both clocks advance at 1x. Their median difference maps the worklet frame
+// 2. While playback is steady, the page samples [render time, currentTime]
+//    pairs via getOutputTimestamp.
+// 3. Both clocks advance at 1x. Their median difference maps a worklet frame
 //    onto the media-element timeline. Seek/startup/capture dead time does not
 //    enter the calculation.
 //
-// The WebM/Opus files are controls. They must report clicks near 1.0000 and
-// 1.3100 before interpreting M4A results:
-//
-//   WebM: ~1.0000 / ~1.3100 -> harness is credible
-//   M4A:  ~1.0000 / ~1.3100 -> element trims AAC presentation offset;
-//                               M4A-in-Audacity marks need -0.0363 s
-//   M4A:  ~1.0363 / ~1.3463 -> element exposes raw AAC timeline;
-//                               use M4A-in-Audacity marks unchanged
-//
-// The spacing between clicks must remain 0.3100 s. A different spacing implies
-// a rate/timeline error rather than a constant origin offset.
+// Design notes (2026-09-06, v3):
+// - ONE shared AudioContext + one AudioWorkletNode for the whole run (a fresh
+//   detector state per file via a reset message). Per-file contexts injected
+//   per-file mapping variance and made Safari 26.6 stop the loop after ~2
+//   files; the shared context cured both. Side effect: the mapping constant
+//   grows by the run's wall clock per file — only the spread within a file is
+//   meaningful, so the absolute Δ is not logged.
+// - iOS autoplay: transient activation expires across awaits. The first
+//   file's play() is issued synchronously inside the click handler (before
+//   the graph setup completes; until the tap connects, file 1 may play
+//   audibly for a moment — harmless on a measurement page). If play() is
+//   still rejected (NotAllowedError), the run pauses and shows a
+//   "tap to continue" button for a fresh gesture.
+// - Full mode captures 11 s, so click C (10.0 s) is measured in addition to
+//   A/B: comparing the mapping around click A (0.5 s after play start) with
+//   the mapping around click C exposes origin-mapping settling.
+// - Per file the page reports the clock-pair MAD and the early→late drift.
+//   Engines have a constant quantization wobble in their clock reporting
+//   (Firefox: MAD ≈ 10.7 ms on every file), so flags are adaptive: the
+//   summary flags a file only if its MAD or drift exceeds twice the run's
+//   own median (minimum 3 ms).
+// - All event waits carry timeouts: a hung file logs an ERROR and the loop
+//   continues with the next file.
 
 const $ = id => document.getElementById(id);
-const log = message => { $('log').textContent += `${message}\n`; };
+const log = message => { $('log').textContent += message + '\n'; };
 
-// Start 0.5 s before click A. The capture reaches beyond click B.
 const SEEK_TO = 0.5;
-const CAPTURE_MS = 1800;
+const QUICK_CAPTURE_MS = 1800;   // clicks A + B
+const FULL_CAPTURE_MS = 11000;   // + click C at 10.0 s
 
 const median = values => {
   const sorted = [...values].sort((a, b) => a - b);
   return sorted.length ? sorted[Math.floor(sorted.length / 2)] : NaN;
 };
+const mad = (values, med) => median(values.map(v => Math.abs(v - med)));
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-
-async function waitForEvent(target, type) {
-  return new Promise(resolve => target.addEventListener(type, resolve, { once: true }));
+function waitForEvent(target, type, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const onEvent = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => {
+      target.removeEventListener(type, onEvent);
+      reject(new Error(`timeout waiting for '${type}'`));
+    }, timeoutMs);
+    target.addEventListener(type, onEvent, { once: true });
+  });
 }
 
-async function measureFile(file) {
-  let ctx;
-  let audio;
-  let clockTimer;
+let ctx = null;
+let detector = null;
+let current = null;  // per-file collection state { clicks, peak }
 
+async function setupGraph() {
+  // ctx already exists (created inside the user gesture); resume + module load.
+  await ctx.resume();
+
+  // Relative module URL: click-worklet.js must sit beside this page and both
+  // must be served through HTTP (e.g. python3 -m http.server 8000).
+  await ctx.audioWorklet.addModule('click-worklet.js');
+
+  detector = new AudioWorkletNode(ctx, 'click-detector');
+  const output = ctx.createGain();
+  // Some engines can optimise a literal zero-gain branch away. A tiny gain
+  // keeps the graph live while remaining inaudible under normal conditions.
+  output.gain.value = 0.00001;
+  detector.connect(output);
+  output.connect(ctx.destination);
+
+  let readyResolve, readyReject;
+  const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+  const readyTimeout = setTimeout(() => readyReject(new Error('ClickDetector did not initialize')), 5000);
+
+  detector.port.onmessage = event => {
+    const message = event.data;
+    if (message.type === 'ready') {
+      clearTimeout(readyTimeout);
+      log(`ClickDetector ready at ${message.sampleRate} Hz`);
+      readyResolve();
+      return;
+    }
+    if (!current) return;
+    if (message.peak !== undefined) current.peak = Math.max(current.peak, message.peak);
+    if (message.type === 'click') {
+      current.clicks.push(message.frame);
+      log(`raw click: frame=${message.frame}`);
+    }
+  };
+  await ready;
+  log(`AudioContext rate: ${ctx.sampleRate} (shared for all files)`);
+}
+
+function waitForContinue() {
+  return new Promise(resolve => {
+    const button = document.createElement('button');
+    button.textContent = 'Tap to grant playback and continue';
+    button.onclick = () => { button.remove(); resolve(); };
+    $('go').after(button);
+  });
+}
+
+async function playWithActivation(audio, playPromise) {
+  try {
+    await (playPromise ?? audio.play());
+  } catch (error) {
+    if (error.name !== 'NotAllowedError') throw error;
+    log('play() blocked by the autoplay policy — tap the button to continue');
+    await waitForContinue();
+    await audio.play();
+  }
+}
+
+async function measureFile(file, captureMs, prestarted = null) {
+  let audio, source, clockTimer;
+  const result = { file, presented: [], madMs: NaN, driftMs: NaN, error: null };
   try {
     log(`--- ${file} ---`);
+    current = { clicks: [], peak: 0 };
+    detector.port.postMessage({ type: 'reset' });
 
-    // The Measure all button is the user activation for each AudioContext and
-    // audio.play() invoked during this sequential run.
-    ctx = new AudioContext();
-    await ctx.resume();
-
-    // Relative module URL: click-worklet.js must sit beside this page and both
-    // must be served through HTTP (e.g. python3 -m http.server 8000).
-    await ctx.audioWorklet.addModule('click-worklet.js');
-    log(`AudioContext rate: ${ctx.sampleRate}`);
-
-    audio = new Audio(file);
+    audio = prestarted?.audio ?? new Audio(file);
     audio.preload = 'auto';
-    await new Promise((resolve, reject) => {
+
+    if (!prestarted) {
       // The first click is only 0.5 s after the seek target. Waiting for
-      // canplaythrough avoids a media-buffering race at the beginning of each
-      // separate measurement.
-      audio.addEventListener('canplaythrough', resolve, { once: true });
-      audio.addEventListener('error', () => {
-        reject(new Error(`media load failed: ${audio.error?.message ?? 'unknown error'}`));
-      }, { once: true });
-      audio.load();
-    });
-    log(`element duration: ${audio.duration.toFixed(3)}`);
+      // canplaythrough avoids a media-buffering race at measurement start.
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("timeout waiting for 'canplaythrough'")), 15000);
+        audio.addEventListener('canplaythrough', () => { clearTimeout(timer); resolve(); }, { once: true });
+        audio.addEventListener('error', () => {
+          clearTimeout(timer);
+          reject(new Error(`media load failed: ${audio.error?.message ?? 'unknown error'}`));
+        }, { once: true });
+        audio.load();
+      });
+    } else if (audio.readyState < 1) {
+      await waitForEvent(audio, 'loadedmetadata', 15000);
+    }
+    log(`element duration ${audio.duration.toFixed(3)}`);
 
-    const source = ctx.createMediaElementSource(audio);
-    const detector = new AudioWorkletNode(ctx, 'click-detector');
-    const output = ctx.createGain();
-
-    // Some engines can optimise a literal zero-gain branch away. A tiny gain
-    // keeps the graph live while remaining inaudible under normal conditions.
-    output.gain.value = 0.00001;
+    source = ctx.createMediaElementSource(audio);
     source.connect(detector);
-    detector.connect(output);
-    output.connect(ctx.destination);
-
-    const clicks = [];
-    let peak = 0;
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(
-        () => reject(new Error('ClickDetector did not initialize')),
-        2000,
-      );
-
-      detector.port.onmessage = event => {
-        const message = event.data;
-        if (message.peak !== undefined) peak = Math.max(peak, message.peak);
-        if (message.type === 'ready') {
-          clearTimeout(timeout);
-          log(`ClickDetector ready at ${message.sampleRate} Hz`);
-          resolve();
-        } else if (message.type === 'click') {
-          clicks.push(message.frame);
-          log(`raw click: frame=${message.frame}`);
-        }
-      };
-    });
 
     // Collect clock pairs only while this file is actually playing. Sampling
-    // before `playing` would reintroduce seek/startup latency into the fit.
+    // before playing would reintroduce seek/startup latency into the fit.
     const clockPairs = [];
     let playing = false;
     clockTimer = setInterval(() => {
       if (!playing) return;
       const timestamp = ctx.getOutputTimestamp();
-      clockPairs.push([timestamp.contextTime, audio.currentTime]);
+      if (Number.isFinite(timestamp.contextTime)) {
+        clockPairs.push([timestamp.contextTime, audio.currentTime]);
+      }
     }, 10);
 
-    audio.currentTime = SEEK_TO;
-    await waitForEvent(audio, 'seeked');
-
-    const playbackStarted = waitForEvent(audio, 'playing');
-    await audio.play();
+    if (!prestarted) {
+      audio.currentTime = SEEK_TO;
+      await waitForEvent(audio, 'seeked');
+    }
+    const playbackStarted = audio.paused ? waitForEvent(audio, 'playing') : Promise.resolve();
+    await playWithActivation(audio, prestarted?.playPromise);
     await playbackStarted;
     playing = true;
     log(`playing from currentTime=${audio.currentTime.toFixed(4)}`);
-
-    await wait(CAPTURE_MS);
+    await wait(captureMs);
     playing = false;
     clearInterval(clockTimer);
     clockTimer = undefined;
@@ -174,65 +214,133 @@ async function measureFile(file) {
 
     // Wait for a final AudioWorklet port message from the final render quantum.
     await wait(50);
+    const { clicks, peak } = current;
     log(`worklet peak=${peak.toFixed(5)}, clicks=${clicks.length}, clock pairs=${clockPairs.length}`);
 
     if (!clicks.length) {
-      log('No click detected. peak=0 means the media-element source rendered silence.');
-      return;
+      result.error = 'no click detected (peak=0 means the media-element source rendered silence)';
+      log('No click detected.');
+      return result;
     }
-    if (!clockPairs.length) {
-      log('No media-clock samples captured.');
-      return;
+    if (clockPairs.length < 10) {
+      result.error = 'too few media-clock samples captured';
+      log(result.error);
+      return result;
     }
 
     // During uninterrupted playback, mediaTime - contextTime is a constant.
-    // The median rejects individual timer/currentTime granularity outliers.
-    const delta = median(
-      clockPairs
-        .map(([contextTime, mediaTime]) => mediaTime - contextTime)
-        .filter(Number.isFinite),
-    );
+    // The median rejects individual timer/currentTime granularity outliers;
+    // the MAD measures the stability of the mapping itself.
+    const deltas = clockPairs.map(([contextTime, mediaTime]) => mediaTime - contextTime);
+    const deltaMedian = median(deltas);
+    result.madMs = mad(deltas, deltaMedian) * 1000;
 
-    const presented = clicks.map(frame => frame / ctx.sampleRate + delta);
-    for (const time of presented) {
-      log(`click presented at currentTime=${time.toFixed(4)}`);
-    }
+    // Early vs late playback windows: detects origin-mapping settling.
+    const windowSize = Math.min(200, Math.floor(clockPairs.length / 4));
+    const early = median(deltas.slice(0, windowSize));
+    const late = median(deltas.slice(-windowSize));
+    result.driftMs = (late - early) * 1000;
+    log(`clock mapping: MAD=${result.madMs.toFixed(1)} ms, early→late drift=${result.driftMs.toFixed(1)} ms`);
 
-    if (presented.length >= 2) {
-      log(`click spacing=${(presented[1] - presented[0]).toFixed(6)} s (expected 0.310000 s)`);
-    }
+    // Map each click with the clock pairs collected around it (±0.75 s),
+    // falling back to all pairs when the neighborhood is too small.
+    result.presented = clicks.map(frame => {
+      const clickContextTime = frame / ctx.sampleRate;
+      const near = clockPairs.filter(([contextTime]) => Math.abs(contextTime - clickContextTime) <= 0.75);
+      const use = near.length >= 10 ? near : clockPairs;
+      return clickContextTime + median(use.map(([contextTime, mediaTime]) => mediaTime - contextTime));
+    });
+    for (const time of result.presented) log(`click presented at currentTime=${time.toFixed(4)}`);
+    if (result.presented.length >= 2) log(`click spacing A→B=${(result.presented[1] - result.presented[0]).toFixed(6)} s (expected 0.310000 s)`);
+    if (result.presented.length >= 3) log(`click spacing B→C=${(result.presented[2] - result.presented[1]).toFixed(6)} s (expected 8.690000 s)`);
   } catch (error) {
+    result.error = error.message;
     log(`ERROR: ${error.message}`);
     console.error(error);
   } finally {
     clearInterval(clockTimer);
+    current = null;
+    try { source?.disconnect(); } catch { /* already disconnected */ }
     audio?.pause();
     audio?.removeAttribute('src');
     audio?.load();
-    await ctx?.close();
-
-    // Give the browser a turn to release the decoder/AudioContext before
-    // loading the next representation. This is especially helpful on iOS.
+    // Give the browser a turn to release the decoder before loading the next
+    // representation. This is especially helpful on iOS.
     await wait(100);
   }
+  return result;
 }
 
-$('go').onclick = async () => {
-  const files = $('files').value
-    .split(/\r?\n/)
-    .map(file => file.trim())
-    .filter(Boolean);
+function printSummary(results) {
+  const valid = results.filter(r => Number.isFinite(r.madMs));
+  if (!valid.length) return;
 
+  // Adaptive thresholds: engines differ in clock-reporting quantization
+  // (Firefox wobbles ±10.7 ms on every file), so flag only outliers against
+  // the run's own baseline.
+  const madLimit = Math.max(3, 2 * median(valid.map(r => r.madMs)));
+  const driftLimit = Math.max(3, 2 * median(valid.map(r => Math.abs(r.driftMs))));
+  const control = valid.find(r => /(^|\/)calibration\.wav$/.test(r.file) && r.presented.length);
+
+  log('');
+  log('=== Summary ===');
+  for (const r of results) {
+    if (!Number.isFinite(r.madMs) || !r.presented.length) {
+      log(`${r.file}: ${r.error ?? 'no result'}`);
+      continue;
+    }
+    let line = `${r.file}: A=${r.presented[0].toFixed(4)}`;
+    if (r.presented.length >= 3) line += ` C=${r.presented[2].toFixed(4)}`;
+    if (control && r !== control) {
+      line += ` (A−WAV=${((r.presented[0] - control.presented[0]) * 1000).toFixed(1)} ms)`;
+    }
+    line += ` MAD=${r.madMs.toFixed(1)} drift=${r.driftMs.toFixed(1)}`;
+    const flags = [];
+    if (r.madMs > madLimit) flags.push('UNSTABLE');
+    if (Math.abs(r.driftMs) > driftLimit) flags.push('DRIFT');
+    if (flags.length) line += `  ⚠ ${flags.join(' ')}`;
+    log(line);
+  }
+  log(`flag thresholds for this run: MAD > ${madLimit.toFixed(1)} ms, |drift| > ${driftLimit.toFixed(1)} ms`);
+}
+
+$('go').onclick = () => {
+  const files = $('files').value.split(/\r?\n/).map(file => file.trim()).filter(Boolean);
   if (!files.length) return;
-
   $('go').disabled = true;
   $('log').textContent = '';
-  try {
-    // Sequential, never parallel: one media element/decoder/AudioContext at a
-    // time keeps autoplay activation, audio routing, and logs deterministic.
-    for (const file of files) await measureFile(file);
-  } finally {
-    $('go').disabled = false;
-  }
+  const captureMs = $('quick').checked ? QUICK_CAPTURE_MS : FULL_CAPTURE_MS;
+
+  // Gesture-critical section (iOS transient activation expires across
+  // awaits): create the context and start the FIRST file's playback
+  // synchronously inside the click handler. The graph attaches a moment
+  // later; until then file 1 may play audibly. Later files are covered by
+  // the Continue-button fallback if activation does not carry over.
+  ctx = new AudioContext();
+  ctx.resume();
+  const firstAudio = new Audio(files[0]);
+  firstAudio.preload = 'auto';
+  try { firstAudio.currentTime = SEEK_TO; } catch { /* pending seek, best effort */ }
+  const firstPlay = firstAudio.play();
+  firstPlay.catch(() => {});  // rejection is handled in measureFile
+
+  (async () => {
+    const results = [];
+    try {
+      await setupGraph();
+      // Sequential, never parallel: one media element/decoder at a time keeps
+      // autoplay activation, audio routing, and logs deterministic.
+      for (let i = 0; i < files.length; i++) {
+        results.push(await measureFile(files[i], captureMs,
+          i === 0 ? { audio: firstAudio, playPromise: firstPlay } : null));
+      }
+    } catch (error) {
+      log(`ERROR: ${error.message}`);
+      console.error(error);
+    } finally {
+      printSummary(results);
+      $('go').disabled = false;
+    }
+  })();
 };
 </script>
