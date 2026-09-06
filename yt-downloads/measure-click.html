@@ -1,101 +1,238 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>measure-click</title>
+<title>Measure calibration clicks</title>
 <style>
   body { font: 14px/1.4 -apple-system, sans-serif; margin: 1em; }
-  #file { width: 22em; }
+  textarea { display: block; width: min(100%, 40em); height: 8em; font: inherit; }
+  button { margin: 0.75em 0; }
   pre { background: #f4f4f4; padding: 1em; white-space: pre-wrap; }
 </style>
 
-<label>file <input id="file" value="yt_calibration-wav.m4a"></label>
-<button id="go">measure</button>
+<label for="files">Files, one per line</label>
+<textarea id="files">yt_calibration-wav.m4a
+yt_calibration-wav.webm
+yt_calibration-wav-corrected.m4a
+yt_calibration-aac.m4a
+yt_calibration-aac.webm
+yt_calibration-opus.m4a
+yt_calibration-opus.webm
+../master/calibration.wav
+../master/calibration.m4a
+</textarea>
+<button id="go">Measure all</button>
 <pre id="log"></pre>
 
 <script type="module">
-// Measures at which HTMLMediaElement.currentTime the calibration clicks
-// (PCM truth: 1.000 s and 1.310 s) are actually presented.
+// Measures the HTMLMediaElement presentation time of the 1 kHz calibration
+// clicks for every listed file. The source PCM timeline defines clicks A/B at
+// 1.000 and 1.310 seconds respectively.
 //
-// Method: an AudioWorklet reports the click's exact render frame; the main
-// thread samples (AudioContext render clock, audio.currentTime) pairs during
-// playback via ctx.getOutputTimestamp(). During playback both clocks advance
-// 1:1, so mediaTime = renderTime + delta with a constant delta estimated
-// from the pairs (median, robust against seek/settle glitches).
-// No capture-start dead time and no callback-pairing bias enter the result.
+// The actual product question is deliberately narrow:
 //
-// Interpretation:
-//   click at ~1.0000 / ~1.3100  -> element presents the trimmed timeline
-//   click at ~1.0363 / ~1.3463  -> element exposes the raw AAC decode timeline
-// Control: the .webm/Opus rendition must read ~1.0000 / ~1.3100.
+//   If audio.currentTime = 1.000, does the browser present the source click
+//   immediately, or does a YouTube AAC raw-decode priming offset (+36.3 ms)
+//   move it to 1.0363?
+//
+// The local/yt-dlp fixture analysis established:
+//
+//   yt_calibration-*.webm -> source PCM click positions (0.0 ms raw offset)
+//   yt_calibration-*.m4a  -> +36.3 ms raw-decode offset, no rate drift
+//
+// This page tests browser *media-element* semantics, not an ffmpeg decode,
+// Audacity import, or decodeAudioData() buffer. It follows the media through
+// the createMediaElementSource() Web Audio path used to observe output samples.
+//
+// Measurement design for each file:
+//
+// 1. click-worklet.js identifies a click at an exact AudioContext render frame.
+// 2. While playback is steady, the page samples (render time, currentTime)
+//    pairs via getOutputTimestamp().
+// 3. Both clocks advance at 1x. Their median difference maps the worklet frame
+//    onto the media-element timeline. Seek/startup/capture dead time does not
+//    enter the calculation.
+//
+// The WebM/Opus files are controls. They must report clicks near 1.0000 and
+// 1.3100 before interpreting M4A results:
+//
+//   WebM: ~1.0000 / ~1.3100 -> harness is credible
+//   M4A:  ~1.0000 / ~1.3100 -> element trims AAC presentation offset;
+//                               M4A-in-Audacity marks need -0.0363 s
+//   M4A:  ~1.0363 / ~1.3463 -> element exposes raw AAC timeline;
+//                               use M4A-in-Audacity marks unchanged
+//
+// The spacing between clicks must remain 0.3100 s. A different spacing implies
+// a rate/timeline error rather than a constant origin offset.
 
 const $ = id => document.getElementById(id);
-const log = m => ($('log').textContent += m + '\n');
+const log = message => { $('log').textContent += `${message}\n`; };
 
-const SEEK_TO = 0.5;   // before cue A (1.000 s)
-const CAPTURE_MS = 1200; // long enough to catch cues A (1.000) and B (1.310)
+// Start 0.5 s before click A. The capture reaches beyond click B.
+const SEEK_TO = 0.5;
+const CAPTURE_MS = 1800;
 
-const median = xs => {
-  const a = [...xs].sort((x, y) => x - y);
-  return a.length ? a[Math.floor(a.length / 2)] : NaN;
+const median = values => {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted.length ? sorted[Math.floor(sorted.length / 2)] : NaN;
 };
 
+const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+async function waitForEvent(target, type) {
+  return new Promise(resolve => target.addEventListener(type, resolve, { once: true }));
+}
+
+async function measureFile(file) {
+  let ctx;
+  let audio;
+  let clockTimer;
+
+  try {
+    log(`--- ${file} ---`);
+
+    // The Measure all button is the user activation for each AudioContext and
+    // audio.play() invoked during this sequential run.
+    ctx = new AudioContext();
+    await ctx.resume();
+
+    // Relative module URL: click-worklet.js must sit beside this page and both
+    // must be served through HTTP (e.g. python3 -m http.server 8000).
+    await ctx.audioWorklet.addModule('click-worklet.js');
+    log(`AudioContext rate: ${ctx.sampleRate}`);
+
+    audio = new Audio(file);
+    audio.preload = 'auto';
+    await new Promise((resolve, reject) => {
+      // The first click is only 0.5 s after the seek target. Waiting for
+      // canplaythrough avoids a media-buffering race at the beginning of each
+      // separate measurement.
+      audio.addEventListener('canplaythrough', resolve, { once: true });
+      audio.addEventListener('error', () => {
+        reject(new Error(`media load failed: ${audio.error?.message ?? 'unknown error'}`));
+      }, { once: true });
+      audio.load();
+    });
+    log(`element duration: ${audio.duration.toFixed(3)}`);
+
+    const source = ctx.createMediaElementSource(audio);
+    const detector = new AudioWorkletNode(ctx, 'click-detector');
+    const output = ctx.createGain();
+
+    // Some engines can optimise a literal zero-gain branch away. A tiny gain
+    // keeps the graph live while remaining inaudible under normal conditions.
+    output.gain.value = 0.00001;
+    source.connect(detector);
+    detector.connect(output);
+    output.connect(ctx.destination);
+
+    const clicks = [];
+    let peak = 0;
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error('ClickDetector did not initialize')),
+        2000,
+      );
+
+      detector.port.onmessage = event => {
+        const message = event.data;
+        if (message.peak !== undefined) peak = Math.max(peak, message.peak);
+        if (message.type === 'ready') {
+          clearTimeout(timeout);
+          log(`ClickDetector ready at ${message.sampleRate} Hz`);
+          resolve();
+        } else if (message.type === 'click') {
+          clicks.push(message.frame);
+          log(`raw click: frame=${message.frame}`);
+        }
+      };
+    });
+
+    // Collect clock pairs only while this file is actually playing. Sampling
+    // before `playing` would reintroduce seek/startup latency into the fit.
+    const clockPairs = [];
+    let playing = false;
+    clockTimer = setInterval(() => {
+      if (!playing) return;
+      const timestamp = ctx.getOutputTimestamp();
+      clockPairs.push([timestamp.contextTime, audio.currentTime]);
+    }, 10);
+
+    audio.currentTime = SEEK_TO;
+    await waitForEvent(audio, 'seeked');
+
+    const playbackStarted = waitForEvent(audio, 'playing');
+    await audio.play();
+    await playbackStarted;
+    playing = true;
+    log(`playing from currentTime=${audio.currentTime.toFixed(4)}`);
+
+    await wait(CAPTURE_MS);
+    playing = false;
+    clearInterval(clockTimer);
+    clockTimer = undefined;
+    audio.pause();
+
+    // Wait for a final AudioWorklet port message from the final render quantum.
+    await wait(50);
+    log(`worklet peak=${peak.toFixed(5)}, clicks=${clicks.length}, clock pairs=${clockPairs.length}`);
+
+    if (!clicks.length) {
+      log('No click detected. peak=0 means the media-element source rendered silence.');
+      return;
+    }
+    if (!clockPairs.length) {
+      log('No media-clock samples captured.');
+      return;
+    }
+
+    // During uninterrupted playback, mediaTime - contextTime is a constant.
+    // The median rejects individual timer/currentTime granularity outliers.
+    const delta = median(
+      clockPairs
+        .map(([contextTime, mediaTime]) => mediaTime - contextTime)
+        .filter(Number.isFinite),
+    );
+
+    const presented = clicks.map(frame => frame / ctx.sampleRate + delta);
+    for (const time of presented) {
+      log(`click presented at currentTime=${time.toFixed(4)}`);
+    }
+
+    if (presented.length >= 2) {
+      log(`click spacing=${(presented[1] - presented[0]).toFixed(6)} s (expected 0.310000 s)`);
+    }
+  } catch (error) {
+    log(`ERROR: ${error.message}`);
+    console.error(error);
+  } finally {
+    clearInterval(clockTimer);
+    audio?.pause();
+    audio?.removeAttribute('src');
+    audio?.load();
+    await ctx?.close();
+
+    // Give the browser a turn to release the decoder/AudioContext before
+    // loading the next representation. This is especially helpful on iOS.
+    await wait(100);
+  }
+}
+
 $('go').onclick = async () => {
-  const file = $('file').value.trim();
-  log(`--- ${file} ---`);
+  const files = $('files').value
+    .split(/\r?\n/)
+    .map(file => file.trim())
+    .filter(Boolean);
 
-  const ctx = new AudioContext();
-  await ctx.resume();
-  await ctx.audioWorklet.addModule('click-worklet.js');
-  log('AudioContext rate: ' + ctx.sampleRate);
+  if (!files.length) return;
 
-  const audio = new Audio(file);
-  await new Promise((res, rej) => {
-    audio.oncanplay = res;
-    audio.onerror = () => rej(new Error('load failed'));
-  });
-  log('element duration: ' + audio.duration.toFixed(3));
-
-  const src  = ctx.createMediaElementSource(audio);
-  const node = new AudioWorkletNode(ctx, 'click-detector');
-  const mute = ctx.createGain();   // render, but stay silent
-  mute.gain.value = 0;
-  src.connect(node); node.connect(mute); mute.connect(ctx.destination);
-
-  const clicks = [];
-  let peak = 0;
-  node.port.onmessage = e => {
-    if (e.data.peak !== undefined) peak = e.data.peak;
-    if (e.data.click !== undefined) clicks.push(e.data.click);
-  };
-
-  audio.currentTime = SEEK_TO;
-  await new Promise(r => (audio.onseeked = r));
-  await audio.play();
-  await new Promise(r => (audio.onplaying = r));
-
-  const pairs = [];   // [contextTime, currentTime] while playing
-  const timer = setInterval(() => {
-    const ts = ctx.getOutputTimestamp();
-    pairs.push([ts.contextTime, audio.currentTime]);
-  }, 25);
-
-  await new Promise(r => setTimeout(r, CAPTURE_MS));
-  clearInterval(timer);
-  audio.pause();
-
-  if (!clicks.length) {
-    log(`no click detected (peak=${peak.toFixed(4)})`
-        + (peak === 0 ? ' — tap rendered silence, see README notes' : ''));
-    ctx.close();
-    return;
+  $('go').disabled = true;
+  $('log').textContent = '';
+  try {
+    // Sequential, never parallel: one media element/decoder/AudioContext at a
+    // time keeps autoplay activation, audio routing, and logs deterministic.
+    for (const file of files) await measureFile(file);
+  } finally {
+    $('go').disabled = false;
   }
-
-  const delta = median(pairs.map(([ct, mt]) => mt - ct).filter(Number.isFinite));
-  const times = clicks.map(f => f / ctx.sampleRate + delta);
-  for (const t of times) log(`click presented at currentTime=${t.toFixed(4)}`);
-  if (times.length > 1) {
-    log(`click spacing: ${(times[1] - times[0]).toFixed(4)} (expected 0.3100)`);
-  }
-  ctx.close();
 };
 </script>
