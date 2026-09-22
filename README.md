@@ -14,13 +14,14 @@ known PCM timeline
 
 The purpose is to determine whether a timestamp read from a downloaded audio asset in Audacity targets the same audible instant when assigned to `HTMLMediaElement.currentTime` in a browser.
 
-Three **master videos** were deliberately created from the same visual and PCM timeline but use different source-audio formats:
+Four **master videos** were deliberately created from the same visual and PCM timeline but use different source-audio formats:
 
 | Upload fixture | Container | Source audio codec | Why it exists |
 |---|---|---|---|
-| `calibration-wav.mov` | QuickTime/MOV | PCM WAV | Reference-quality upload; no lossy source-codec delay |
+| `calibration-wav.mov` | QuickTime/MOV | PCM WAV 48 kHz | Reference-quality upload; no lossy source-codec delay |
 | `calibration-aac.mp4` | MP4 | AAC-LC | Models a creator who uploads AAC/MP4 audio |
 | `calibration-opus.webm` | WebM | Opus | Models a creator who uploads Opus/WebM audio |
+| `calibration-wav_44k.mov` | QuickTime/MOV | PCM WAV 44.1 kHz | Probes source-sample-rate dependence (added 2026-09-22 with the `k8xKWKqk0A4` investigation) |
 
 YouTube creates its own delivery representations after upload. The input codecs are therefore not expected to be served unchanged; the test determines whether YouTube's generated AAC/M4A and Opus/WebM timelines depend on the creator's input format.
 
@@ -35,12 +36,13 @@ YouTube creates its own delivery representations after upload. The input codecs 
 │   ├── calibration-44k.m4a            # local AAC encode at 44.1 kHz (sample-rate probe)
 │   ├── calibration.opus               # local Opus encode
 │   ├── calibration-video.mp4          # visual master (white-flash track)
-│   ├── calibration-wav.mov            # upload master, PCM audio
+│   ├── calibration-wav.mov            # upload master, PCM 48 kHz audio
+│   ├── calibration-wav_44k.mov        # upload master, PCM 44.1 kHz audio
 │   ├── calibration-aac.mp4            # upload master, AAC audio
 │   └── calibration-opus.webm          # upload master, Opus audio
 ├── yt-downloads/                      # YouTube delivery assets + browser harness
-│   ├── yt_calibration-{wav,aac,opus}.m4a
-│   ├── yt_calibration-{wav,aac,opus}.webm
+│   ├── yt_calibration-{wav,aac,opus,wav_44k}.m4a
+│   ├── yt_calibration-{wav,aac,opus,wav_44k}.webm
 │   ├── yt_calibration-wav-corrected.m4a
 │   ├── yt_calibration-*.ffprobe.txt
 │   ├── measure-click.html
@@ -331,13 +333,24 @@ shasum -a 256 \
 
 ## YouTube uploads
 
-The three master videos were published as unlisted YouTube videos on 2026-09-02:
+The master videos were published as unlisted YouTube videos on 2026-09-02,
+the 44.1 kHz arm on 2026-09-22:
 
 | Master video | Source audio | YouTube video |
 |---|---|---|
-| `calibration-wav.mov` | PCM | [pZg-6ptiri4](https://youtu.be/pZg-6ptiri4) |
+| `calibration-wav.mov` | PCM 48 kHz | [pZg-6ptiri4](https://youtu.be/pZg-6ptiri4) |
 | `calibration-aac.mp4` | AAC-LC | [DZFI8VRo8EQ](https://youtu.be/DZFI8VRo8EQ) |
 | `calibration-opus.webm` | Opus | [yFGvJwqGYL8](https://youtu.be/yFGvJwqGYL8) |
+| `calibration-wav_44k.mov` | PCM 44.1 kHz | [fdTfv0rK5nM](https://youtu.be/fdTfv0rK5nM) |
+
+The 44.1 kHz PCM arm probes source-rate dependence: generate it from the
+existing master before uploading (the `.mov` is committed under `master/`):
+
+```bash
+ffmpeg -y -i calibration.wav -ar 44100 -c:a pcm_s24le calibration-wav_44k.wav
+ffmpeg -y -stream_loop -1 -i calibration-video.mp4 -i calibration-wav_44k.wav \
+  -map 0:v:0 -map 1:a:0 -c:v copy -c:a copy -shortest calibration-wav_44k.mov
+```
 
 If a master changes, upload a new unlisted video, wait for processing to complete, and update the table before repeating the retrieval and measurement steps.
 
@@ -367,6 +380,7 @@ done <<'EOF'
 pZg-6ptiri4 wav
 DZFI8VRo8EQ aac
 yFGvJwqGYL8 opus
+fdTfv0rK5nM wav_44k
 EOF
 ```
 
@@ -376,6 +390,7 @@ Expected downloads:
 yt_calibration-wav.m4a    yt_calibration-wav.webm
 yt_calibration-aac.m4a    yt_calibration-aac.webm
 yt_calibration-opus.m4a   yt_calibration-opus.webm
+yt_calibration-wav_44k.m4a    yt_calibration-wav_44k.webm
 ```
 
 If a file gets a different extension, the selection fell back; inspect it with `yt-dlp -F` rather than accepting a misleading name.
@@ -435,16 +450,39 @@ python3 scripts/extract-clicks.py \
 | `master/calibration.opus` | 0.0 ms | 0.0 ms | Local Ogg/Opus pre-skip/end trimming is aligned |
 | `master/calibration-44k.m4a` | 0.0 ms (by construction) | — | Local 44.1 kHz AAC; local encodes are source-aligned (edit list) |
 | `yt_calibration-{wav,aac,opus}.m4a` | +36.3 ms | 0.0 ms | YouTube AAC raw decode has a deterministic leading offset |
+| `yt_calibration-wav_44k.m4a` (`fdTfv0rK5nM`, 2026-09-22) | +36.3 ms | 0.0 ms | 44.1 kHz PCM source: same class; source rate is not a trigger |
 | `yt_calibration-{wav,aac,opus}.webm` | 0.0 ms | 0.0 ms | YouTube Opus raw decode is aligned |
 | `yt_calibration-wav-corrected.m4a` | 0.0 ms | 0.0 ms | Corrected rendition decodes source-aligned (edit list applied by FFmpeg) |
+| `k8xKWKqk0A4.140.m4a` (real piece, 2018) | +13.06 ms vs its webm | 0.0 ms | Per-rendition exception, see below |
 
-The +36.3 ms offset is constant at all five cues (1.000, 1.310, 10.000, 30.000, 59.000 s) and across all three upload-source codecs. At 44.1 kHz it is approximately 1600 samples, consistent with AAC priming/encoder-delay accounting:
+The +36.3 ms offset is constant at all five cues (1.000, 1.310, 10.000, 30.000, 59.000 s) and across all three upload-source codecs, and the 44.1 kHz PCM arm shows the same value. At 44.1 kHz it is approximately 1600 samples, consistent with AAC priming/encoder-delay accounting:
 
 \[
 0.0363\text{ s} \times 44100\text{ Hz} \approx 1601\text{ samples}
 \]
 
-Therefore YouTube does **not** stretch AAC relative to Opus and there is no rate drift. It places the decoded AAC musical content at a stable later origin. The creator's uploaded audio codec—PCM, AAC, or Opus—does not change that behaviour.
+Therefore YouTube does **not** stretch AAC relative to Opus and there is no rate drift. It places the decoded AAC musical content at a stable later origin. The creator's uploaded audio codec—PCM, AAC, or Opus—does not change that behaviour. This is the **frequent class**, not a universal constant; see the exception below.
+
+### Per-rendition exception: `k8xKWKqk0A4` (2026-09-22)
+
+Video `k8xKWKqk0A4` ("Godba Domžale - A Christmas Rockfestival", 2018) measures **576 samples at 44.1 kHz = 13.0612 ms** in its itag-140 AAC (`+627 @ 48 kHz`), and the whole AAC pair shifts coherently:
+
+| Rendition | vs the 251 webm reference | @44.1 kHz |
+|---|---:|---:|
+| `k8xKWKqk0A4.140.m4a` (AAC-LC, DASH) | +627 @48k | +576 |
+| `k8xKWKqk0A4.139.m4a` (HE-AAC, DASH) | +1609 @22.05k core | +3218 output |
+| `k8xKWKqk0A4.234` (HLS, raw ADTS) | byte-identical AAC payloads, same +13.06 ms | |
+| eight reference renditions (2010-2026, incl. `gxU265_H6m4` 2018-01-25) | +1742 @48k | +1600 |
+
+The 139-140 difference is 2642 output samples in both classes, so the pair is internally consistent; the anomaly shifts both by exactly 1024 output samples (23.22 ms). Forensics that rule out the container, the packaging, the codec profile and the webm reference:
+
+- identity `elst` (`media_time=0`) in every file, no `iTunSMPB`, `initial_padding=0`, no negative CTS, 1024-sample packets;
+- identical `sgpd`/`sbgp` roll groups (`-1` on all samples) and identical AAC-LC 44.1 kHz stereo AudioSpecificConfig;
+- uniform WebM parameters in every file including `k8xKWKqk0A4`: `CodecDelay=6.5 ms`, `SeekPreRoll=80 ms`, OpusHead pre-skip 312;
+- the HLS 234 is raw ADTS (no container at all) with byte-identical AAC payloads to the DASH 140 from frame 0;
+- a 44.1 kHz PCM source (`fdTfv0rK5nM`) and a second 2018 upload (`gxU265_H6m4`) both measure the standard 1600-sample class, ruling out source rate and upload year.
+
+The offset is therefore the encoded content origin itself: this rendition's AAC encoders produced content 1024 output samples earlier than the class value. Consequence for the pipeline: the M4A correction offset is **measured per file** against the retained webm reference; the 1600-sample constant remains only the no-reference fallback.
 
 ## Container forensics (edit lists)
 
@@ -492,7 +530,7 @@ ffmpeg -itsoffset -0.0362812 \
 
 Mechanism: `-itsoffset` shifts the input timestamps; the first packet lands at a negative PTS (−1600 samples at 44.1 kHz), and the MP4 muxer — which cannot store negative media times — re-bases the media timeline and records the shift as an edit list (`elst` with `media_time=1600`; confirmed with `dump-elst.py` on the real corrected file, 2026-09-06). The AAC bitstream is copied unchanged (`-c:a copy`); only container metadata is added. The result carries exactly the same edit-list structure that makes the locally encoded `master/calibration.m4a` source-aligned everywhere — just with YouTube's 1600-sample priming instead of FFmpeg's 1024. The mechanism was first validated on a simulated fixture (undeclared priming → muxer writes the trimming edit list; decode-aligned; bitstream MD5-identical).
 
-The offset constant is 1600 samples at 44.1 kHz = 36.281 ms (`-itsoffset -0.0362812`); cross-correlation against the Opus rendition (`scripts/compare-drift.py`) measured 36.292 ± 0.02 ms. It is a global property of YouTube's AAC rendition: the same +36.3 ms was measured on an unrelated real piece (video `xX1Y0cxstBw`, outside this fixture set). It must **not** be applied to locally encoded files or to a last-resort local transcode of a YouTube track, both of which are already source-aligned.
+The class correction is 1600 samples at 44.1 kHz = 36.281 ms (`-itsoffset -0.0362812`); cross-correlation against the Opus rendition (`scripts/compare-drift.py`) measured 36.292 ± 0.02 ms for the calibration corpus and the unrelated real piece `xX1Y0cxstBw`. It is the **frequent class**, not a global property: `k8xKWKqk0A4` needs 576 samples = 13.0612 ms (per-rendition exception above). A correction must **not** be applied to locally encoded files or to a last-resort local transcode of a YouTube track, both of which are already source-aligned.
 
 Verification of the corrected fixture:
 
@@ -501,7 +539,7 @@ Verification of the corrected fixture:
 - Audacity (2026-09-03): imported side by side with `master/calibration.m4a`, all peaks align exactly; the corrected file displays 34 ms longer (60.034 vs 60.000 s) because YouTube's larger end padding survives in the raw span — cosmetic.
 - Browsers (2026-09-06, harness v3): Firefox +0.7 ms, Chromium +1.4 ms, Safari ≈ −7 ms vs the WAV control, each constant from click A to click C — the remaining per-engine constant is the 44.1 kHz presentation shift (see "Browser results"), not a correction error.
 
-Guard for the pipeline: after correcting a fresh download, `extract-clicks.py` must read 0.0 ms — and a cross-correlation of the fresh download against the kept Opus/WebM authoring reference (`scripts/compare-drift.py`) must read ≈ 36.3 ms before correction and 0.0 ms after. If a future YouTube download measures an offset different from +36.3 ms, YouTube changed its encoding pipeline and the constant must be re-derived.
+Guard for the pipeline: measure the raw download against the kept Opus/WebM reference (`scripts/compare-drift.py` / `timeline-drift.mjs`), apply that measured offset, and verify 0.0 ms after correction (`extract-clicks.py` reads 0.0 ms for fixture downloads). The measured raw offset is 36.3 ms for the frequent class and 13.06 ms for `k8xKWKqk0A4`; it is a per-file measurement, not an assumed constant. If a new offset class appears, record it here with the same forensics (container boxes, esds, webm parameters, HLS/DASH frame comparison) instead of patching individual files.
 
 ## Browser measurement harness
 
@@ -676,11 +714,11 @@ The clean proof that the shift is sample-rate-dependent: the local 44.1 kHz enco
 
 - YouTube's output timing is independent of whether the source upload used PCM, AAC, or Opus.
 - YouTube WebM/Opus decodes at the source cue positions in FFmpeg analysis.
-- YouTube M4A/AAC decodes with a fixed +36.3 ms content offset in FFmpeg/Audacity-like raw decode analysis.
-- The AAC offset is constant from 1 s to 59 s; it is priming/origin accounting, not stretching or rate drift.
+- YouTube M4A/AAC decodes with a rendition-specific content offset in FFmpeg/Audacity-like raw decode analysis: +36.3 ms in the frequent class, +13.06 ms for `k8xKWKqk0A4` (2026-09-22 exception, identical in DASH, HLS and its HE-AAC 139).
+- The AAC offset is constant from 1 s to 59 s in both classes; it is priming/origin accounting, not stretching or rate drift.
 - The offset is a property of **YouTube's** AAC rendition, not of AAC/MP4 in general: the locally encoded `master/calibration.m4a` (FFmpeg edit list, `media_time=1024`) presents source-aligned in every engine tested.
 - The YouTube M4A declares no trim signaling at all (identity edit list, no `iTunSMPB`), so the raw coordinate is the only coordinate any consumer can present — the behaviour cannot silently change due to metadata-interpretation differences.
-- The missing trim can be restored losslessly at sync time: a stream copy with `-itsoffset -0.0362812` makes the muxer write an edit list with `media_time=1600` (confirmed by `dump-elst.py`), after which the M4A presents source-aligned in FFmpeg decode, Audacity, and the browser element.
+- The missing trim can be restored losslessly at sync time: a stream copy with `-itsoffset -<measured offset>` makes the muxer write the matching edit list (`media_time` ≈ 1600 for the frequent class, ≈ 576 for `k8xKWKqk0A4`, within the guard's 8 kHz resolution; confirmed by `dump-elst.py`), after which the M4A presents source-aligned in FFmpeg decode, Audacity, and the browser element.
 
 ### Browser timing (verified 2026-09-02…06)
 
@@ -701,11 +739,11 @@ The clean proof that the shift is sample-rate-dependent: the local 44.1 kHz enco
 
 ### Timestamp authoring policy (final)
 
-1. **Canonical coordinate: the source PCM timeline.** It is presented identically by the uploaded video (and hence the YouTube IFrame player, which keeps its Opus audio rendition in A/V sync with the video track), by YouTube's Opus/WebM download, by locally encoded files, and by the corrected YouTube M4A. Marks authored against any of these artifacts are mutually valid without conversion. Marks read from an *uncorrected* YouTube M4A sit +36.3 ms late relative to source and would need `t_src = t_m4a − 0.0363`; the pipeline avoids that case by correcting the artifact instead.
-2. **YouTube pieces: keep two local files per piece, ship one.** `sync-media` downloads both renditions: the Opus/WebM (itag 251) and the AAC/M4A (itag 140), and corrects the M4A at sync time (`ffmpeg -itsoffset -0.0362812 -i <download>.m4a -c:a copy audio/<key>.m4a`; verify with `scripts/dump-elst.py` (`media_time=1600`) and `scripts/extract-clicks.py` (0.0 ms)). The layout in `audio/` is `<key>.webm` + `<key>.m4a`: the WebM is the **authoring reference** — YouTube's highest-quality audio track, source-aligned without any processing — and doubles as the cross-correlation baseline for the pipeline guard; the corrected M4A is the **playback artifact** and the only file that ships (the staging/bundle step must filter by extension: `<key>.m4a` + peaks JSON into `dist-audio/`, never the `.webm`). **Author timestamps against the WebM in Audacity**; use the corrected M4A when verifying how a mark plays. Legacy marks authored against Opus artifacts are already source-aligned and remain valid unchanged.
+1. **Canonical coordinate: the source PCM timeline.** It is presented identically by the uploaded video (and hence the YouTube IFrame player, which keeps its Opus audio rendition in A/V sync with the video track), by YouTube's Opus/WebM download, by locally encoded files, and by the corrected YouTube M4A. Marks authored against any of these artifacts are mutually valid without conversion. Marks read from an *uncorrected* YouTube M4A sit late relative to source (frequent class +36.3 ms, `k8xKWKqk0A4` +13.06 ms) and would need `t_src = t_m4a − offset`; the pipeline avoids that case by measuring the offset and correcting the artifact.
+2. **YouTube pieces: keep two local files per piece, ship one.** `sync-media` downloads both renditions: the Opus/WebM (itag 251) and the AAC/M4A (itag 140), measures the raw M4A against the webm reference, and corrects the M4A at sync time (`ffmpeg -itsoffset -<measured> -i <download>.m4a -c:a copy audio/<key>.m4a`; the class offsets are 0.0362812 s and 0.0130612 s; verify with `scripts/dump-elst.py` (matching `media_time`: 1600 or 576 within one 8 kHz step) and `scripts/extract-clicks.py` (0.0 ms)). The layout in `audio/` is `<key>.webm` + `<key>.m4a`: the WebM is the **authoring reference** — YouTube's highest-quality audio track, source-aligned without any processing — and doubles as the cross-correlation baseline for the pipeline guard; the corrected M4A is the **playback artifact** and the only file that ships (the staging/bundle step must filter by extension: `<key>.m4a` + peaks JSON into `dist-audio/`, never the `.webm`). **Author timestamps against the WebM in Audacity**; use the corrected M4A when verifying how a mark plays. Legacy marks authored against Opus artifacts are already source-aligned and remain valid unchanged.
 3. Record which artifact and coordinate system a piece's marks belong to in the piece JSON5 (see the `authoring` provenance object in the piece format spec), so future format changes remain documented constant shifts rather than archaeology.
 4. Ogg/Opus remains disabled for production on WebKit (bug 293310). The Opus pipeline may be re-evaluated when Safari (a) reports a correct `HTMLMediaElement.duration` and correct seeks for the Ogg/Opus fixture, or — for shipping Opus-in-**WebM** via the element — (b) once the silent-tap limitation is resolved and the harness can verify WebM/Opus seek and `currentTime` accuracy in Safari. Until then, M4A is the shipped format.
-5. The +36.3 ms offset and its correction are specific to YouTube's AAC rendition. Own recordings encoded locally with FFmpeg (`media-in` pipeline) are source-aligned in all engines and need no correction.
+5. The priming offset and its correction are specific to YouTube's AAC renditions and measured per file (frequent class +36.3 ms, exception +13.06 ms). Own recordings encoded locally with FFmpeg (`media-in` pipeline) are source-aligned in all engines and need no correction.
 6. The same piece JSON drives both player modes, and both are now source-aligned: the YouTube IFrame player via its Opus rendition and A/V sync, the audio mode via the corrected M4A. The only residuals are the documented per-engine 44.1 kHz presentation constants (worst case ≈ −7 ms on Safari — constant, sub-frame at the typical 25 fps of score videos, and inside the 0.01 s budget), so the player needs no runtime offset or browser detection.
 
-MP4/AAC is the canonical **shipping format**; Opus/WebM is kept locally as the authoring reference and guard baseline. The M4A's only timing deviation — the constant, measurable, well-understood +36.3 ms YouTube rendition offset — is corrected once at sync time by a lossless edit-list remux, so JSON timestamps, precomputed peaks, Audacity authoring, and both player modes all share the source coordinate.
+MP4/AAC is the canonical **shipping format**; Opus/WebM is kept locally as the authoring reference and guard baseline. The M4A's only timing deviation — the measurable, well-understood YouTube rendition offset, +36.3 ms in the frequent class and +13.06 ms for `k8xKWKqk0A4` — is measured per file and corrected once at sync time by a lossless edit-list remux, so JSON timestamps, precomputed peaks, Audacity authoring, and both player modes all share the source coordinate.
